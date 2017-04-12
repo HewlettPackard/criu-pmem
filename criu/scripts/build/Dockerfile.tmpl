@@ -1,0 +1,24 @@
+RUN apt-get clean
+
+RUN apt-get update
+
+RUN apt-get install -y \
+                build-essential \
+                protobuf-c-compiler \
+                libprotobuf-c0-dev \
+                libprotobuf-dev \
+                bsdmainutils \
+                protobuf-compiler \
+                python-minimal \
+                libaio-dev \
+                libcap-dev \
+                iptables \
+                libnl-3-dev \
+                libselinux-dev \
+                pkg-config \
+                git-core
+
+COPY . /criu
+WORKDIR /criu
+
+RUN make clean && make -j $(nproc)

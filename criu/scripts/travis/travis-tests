@@ -1,0 +1,63 @@
+#!/bin/sh
+set -x -e
+
+ulimit -c unlimited
+
+cd ../../
+
+service apport stop
+echo "|`pwd`/test/abrt.sh %P %p %s %e" > /proc/sys/kernel/core_pattern
+
+apt-get update -qq
+apt-get install -qq protobuf-c-compiler libprotobuf-c0-dev libaio-dev	\
+	libprotobuf-dev protobuf-compiler python-ipaddr libcap-dev	\
+	libnl-3-dev gdb bash python-protobuf
+chmod a+x $HOME
+export GCOV=1
+make
+make -C test/zdtm
+
+./criu/criu check
+./criu/criu check --all || echo $?
+./criu/criu cpuinfo dump
+./criu/criu cpuinfo check
+
+umask 0000
+export SKIP_PREP=1
+# The 3.19 Ubuntu kernel has a bug. When pagemap are read for a few vma-s
+# for one read call, it returns incorrect data.
+# https://github.com/xemul/criu/issues/207
+export CRIU_PMC_OFF=1
+
+chmod 0777 test/
+chmod 0777 test/zdtm/static
+chmod 0777 test/zdtm/transition
+
+./test/zdtm.py run -a -x 'cgroup*' -p 2
+
+bash ./test/jenkins/criu-fault.sh
+bash ./test/jenkins/criu-fcg.sh
+bash ./test/jenkins/criu-inhfd.sh
+
+make -C test/others/mnt-ext-dev/ run
+make -C test/others/exec/ run
+
+./test/zdtm.py run -t zdtm/static/env00 --sibling
+
+./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --dedup
+./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server
+
+./test/zdtm.py run -t zdtm/static/socket-tcp-local --norst
+
+ip net add test
+./test/zdtm.py run -t zdtm/static/env00 -f h --join-ns
+
+pip install flake8
+make lint
+
+# Check that help output fits into 80 columns
+WIDTH=$(./criu/criu --help | wc --max-line-length)
+if [ "$WIDTH" -gt 80 ]; then
+	echo "criu --help output does not obey 80 characters line width!"
+	exit 1
+fi
