@@ -61,7 +61,7 @@ If you would like to use make test you should install libaio-devel (RPM) or liba
 For test launcher zdtm.py you need PyYAML (RPM) or python-yaml (DEB).
 -->
 
-#### Get CRIU-PMEM Code
+#### Get CRIU-PMEM
 HPE Internal: 
 ```
 git clone https://github.hpe.com/labs/criu-pmem
@@ -80,7 +80,7 @@ mount -o dax /dev/pmem0 /mnt/pmem0
 ```
 -->
 
-#### Build criu-pmem
+#### Build CRIU-PMEM
 
 ```
 cd criu-pmem/criu
@@ -88,7 +88,7 @@ make
 sudo ./criu/criu check
 ```
 
-#### Test criu-pmem
+#### Test CRIU-PMEM
 
 Here is an example that suspends and restores a simple Linux application using CRIU-PMEM.
 
@@ -100,15 +100,15 @@ gcc -o count count.c
 ./count
 ```
 
-Open another console and run criu-pmem to suspend and restore the count program.
+Open another console and run CRIU-PMEM to suspend and restore the count program.
 ```
 pgrep count  
 sudo criu-pmem/criu/criu/criu dump -t <process-id> -D <directory> -j
 sudo criu-pmem/criu/criu/criu restore -D <directory> -j
 ```
-process-id is the process id of the application that will be checkpointed.
+"process-id" is the process id of the application that will be checkpointed.
 
-directory is to store the checkpoints and can be any directory on HDD, SSD or NVM (real or emulated one).
+"directory" is to store the checkpoints and can be any directory on HDD, SSD or NVM (real or emulated one).
 
 You may get the following warnings, which can be ignored. 
 ```
@@ -118,7 +118,7 @@ Warn  (criu/arch/x86/crtools.c:133): Will restore 15138 with interrupted system 
 
 ####  Another implemenation
 
-This is another implementation of criu-pmem using Non-Volatile-Memory Library (nvml). It's in branch 'libpmem'. Here are the steps to build and test this version.
+This is another implementation of CRIU-PMEM using Non-Volatile-Memory Library (nvml). It's in branch 'libpmem'. Here are the steps to build and test this version.
 
 Download and install nvml (follow the instrutions at https://github.com/pmem/nvml/tree/master
 
@@ -127,7 +127,7 @@ switch to branch 'libpmem'
 git checkout libpmem
 ```
 
-Follow the instructions in the master branch to build and test criu-pmem. 
+Follow the instructions in the master branch to build and test CRIU-PMEM. 
 
 ## Interfaces
 
@@ -189,7 +189,7 @@ docker restore --image-dir <pathToDumpFiles> <cid>
 
 #### Configure NVM device (optional)
 
-You can test criu-pmem with any storage devices such as HDD, SSD or NVM. 
+You can test CRIU-PMEM with any storage devices such as HDD, SSD or NVM. 
 
 You can emulate a NVM device using DRAM. The detail instructions are avaiable at https://nvdimm.wiki.kernel.org/. Here is an example showing how to reserve 16GB DRAM to emualte a NVDIMM device on a BFC machine.
 
