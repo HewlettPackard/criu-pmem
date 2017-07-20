@@ -1,0 +1,19 @@
+language: c
+sudo: required
+dist: trusty
+services:
+  - docker
+env:
+  - TR_ARCH=local
+  - TR_ARCH=x86_64
+  - TR_ARCH=armv7hf
+  - TR_ARCH=aarch64
+  - TR_ARCH=ppc64le
+  - TR_ARCH=alpine
+script:
+  - sudo make -C scripts/travis $TR_ARCH
+after_success:
+  - sudo apt-get install -qq -y lcov
+  - gem install coveralls-lcov
+  - sudo lcov --directory criu --capture --output-file coverage.info
+  - coveralls-lcov coverage.info
