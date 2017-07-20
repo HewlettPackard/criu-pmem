@@ -1,4 +1,0 @@
-(00.000049) Version: 3.1 (gitid v3.1)
-(00.000084) No inventory.img image
-(00.000096) Error (criu/util.c:560): Can't read link of fd -404: No such file or directory
-(00.000103) Error (criu/protobuf.c:75): Unexpected EOF on (null)

@@ -1,6 +1,0 @@
-syntax = "proto2";
-
-message fifo_entry {
-	required uint32		id		= 1;
-	required uint32		pipe_id		= 2;
-}
