@@ -3,11 +3,11 @@
 #include <arpa/inet.h>
 #include <linux/falloc.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 
+#include "types.h"
 #include "cr_options.h"
 #include "servicefd.h"
 #include "image.h"
@@ -16,6 +16,12 @@
 #include "util.h"
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "fcntl.h"
+#include "mem.h"
+#include <sys/time.h>
+
+//#define DBG
+
 
 static int page_server_sk = -1;
 
@@ -43,6 +49,14 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 
 #define PS_TYPE_BITS	8
 #define PS_TYPE_MASK	((1 << PS_TYPE_BITS) - 1)
+
+
+static inline long nt_splice(int fd_in, int fd_out, size_t len, unsigned int flags)
+{
+	return syscall(400, fd_in, fd_out, len, flags);
+}
+
+
 
 static inline u64 encode_pm_id(int type, long id)
 {
@@ -152,9 +166,11 @@ static int write_pagemap_loc(struct page_xfer *xfer,
 	int ret;
 	PagemapEntry pe = PAGEMAP_ENTRY__INIT;
 
-	iovec2pagemap(iov, &pe);
+	pe.vaddr = encode_pointer(iov->iov_base);
+	pe.nr_pages = iov->iov_len / PAGE_SIZE;
 	if (opts.auto_dedup && xfer->parent != NULL) {
-		ret = dedup_one_iovec(xfer->parent, iov);
+		ret = dedup_one_iovec(xfer->parent, pe.vaddr,
+				pagemap_len(&pe));
 		if (ret == -1) {
 			pr_perror("Auto-deduplication failed");
 			return ret;
@@ -163,36 +179,66 @@ static int write_pagemap_loc(struct page_xfer *xfer,
 	return pb_write_one(xfer->pmi, &pe, PB_PAGEMAP);
 }
 
-static int write_pages_loc(struct page_xfer *xfer,
-		int p, unsigned long len)
+
+
+static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
-	char *buffer = malloc(sizeof(char) * len);
-	if (buffer == NULL){
-		pr_err("Unable to allocate a buffer with size %lu\n", len);
-		return -1;
+	ssize_t curr = 0;
+
+
+	// Jay
+	// When using --use-pmem flag and pre-dump, we use read and write method
+	if(opts.use_pmem == true){
+		char *buffer = malloc(len);
+
+        	if (buffer == NULL){
+                	pr_perror("Unable to allocate a buffer with size %lu\n", len);
+                	return -1;
+        	}
+
+        	ret = read(p, buffer, len);
+        	if (ret == -1) {
+                	pr_perror("Unable to read data from the pipe");
+                	return -1;
+        	}
+        	if (ret != len) {
+                	pr_err("Only %zu of %lu bytes have been reading\n", ret, len);
+                	return -1;
+      		}
+
+	      	ret = write(img_raw_fd(xfer->pi), buffer, len);
+        	if (ret == -1) {
+             		pr_perror("Unable to write data from the pipe to the file");
+                	return -1;
+        	}
+      		if (ret != len) {
+                	pr_err("Only %zu of %lu bytes have been writting\n", ret, len);
+        	        return -1;
+        	}
+      
+		free(buffer);
 	}
-	ret = read(p, buffer, len);
-	if (ret == -1) {
-		pr_perror("Unable to read data from the pipe");
-		return -1;
+	else{
+		while (1) {
+		//	if(opts.use_pmem == true)
+		//		ret = nt_splice(p, img_raw_fd(xfer->pi), len, SPLICE_F_MOVE);
+		//	else
+				ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len, SPLICE_F_MOVE);
+
+			if (ret == -1) {
+				pr_perror("Unable to spice data");
+				return -1;
+			}
+			curr += ret;
+			if (curr == len)
+				break;
+		}
 	}
-	if (ret != len) {
-		pr_err("Only %zu of %lu bytes have been reading\n", ret, len);
-		return -1;
-	}
-	ret = write(img_raw_fd(xfer->pi), buffer, len);
-	if (ret == -1) {
-		pr_perror("Unable to write data to the pipe");
-		return -1;
-	}
-	if (ret != len) {
-		pr_err("Only %zu of %lu bytes have been writting\n", ret, len);
-		return -1;
-	}
-	free(buffer);
+
 	return 0;
 }
+
 
 static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 {
@@ -211,23 +257,23 @@ static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
 	off = (unsigned long)iov->iov_base;
 	end = off + iov->iov_len;
 	while (1) {
-		struct iovec piov;
 		unsigned long pend;
 
-		ret = p->seek_page(p, off, true);
-		if (ret <= 0 || !p->pe)
+		ret = p->seek_pagemap(p, off);
+		if (ret <= 0 || !p->pe) {
+			pr_err("Missing %lx in parent pagemap\n", off);
 			return -1;
+		}
 
-		pagemap2iovec(p->pe, &piov);
-		pr_debug("\tFound %p/%zu\n", piov.iov_base, piov.iov_len);
+		pr_debug("\tFound %"PRIx64"/%lu\n", p->pe->vaddr, pagemap_len(p->pe));
 
 		/*
-		 * The pagemap entry in parent may heppen to be
+		 * The pagemap entry in parent may happen to be
 		 * shorter, than the hole we write. In this case
 		 * we should go ahead and check the remainder.
 		 */
 
-		pend = (unsigned long)piov.iov_base + piov.iov_len;
+		pend = p->pe->vaddr + pagemap_len(p->pe);
 		if (end <= pend)
 			return 0;
 
@@ -251,7 +297,8 @@ static int write_pagehole_loc(struct page_xfer *xfer, struct iovec *iov)
 		}
 	}
 
-	iovec2pagemap(iov, &pe);
+	pe.vaddr = encode_pointer(iov->iov_base);
+	pe.nr_pages = iov->iov_len / PAGE_SIZE;
 	pe.has_in_parent = true;
 	pe.in_parent = true;
 
@@ -272,13 +319,22 @@ static void close_page_xfer(struct page_xfer *xfer)
 	close_image(xfer->pmi);
 }
 
-static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id)
+static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, long id, bool must_open)
 {
-	xfer->pmi = open_image(fd_type, O_DUMP, id);
-	if (!xfer->pmi)
-		return -1;
+	u32 pages_id;
 
-	xfer->pi = open_pages_image(O_DUMP, xfer->pmi);
+	xfer->pmi = open_image(fd_type, O_DUMP, id);
+	if (!xfer->pmi){
+		return -1;
+	}
+
+	//printf("open pages image start here!!!!!!!!!!!!!\n");
+
+	if(must_open == true)
+		xfer->pi = open_pages_image(true, O_DUMP, xfer->pmi, &pages_id);
+	else
+		xfer->pi = open_pages_image((!opts.use_pmem), O_DUMP, xfer->pmi, &pages_id);
+
 	if (!xfer->pi) {
 		close_image(xfer->pmi);
 		return -1;
@@ -326,12 +382,12 @@ out:
 	return 0;
 }
 
-int open_page_xfer(struct page_xfer *xfer, int fd_type, long id)
+int open_page_xfer(struct page_xfer *xfer, int fd_type, long id, bool must_open)
 {
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, id);
 	else
-		return open_page_local_xfer(xfer, fd_type, id);
+		return open_page_local_xfer(xfer, fd_type, id, must_open);
 }
 
 static int page_xfer_dump_hole(struct page_xfer *xfer,
@@ -342,15 +398,16 @@ static int page_xfer_dump_hole(struct page_xfer *xfer,
 	pr_debug("\th %p [%u]\n", hole->iov_base,
 			(unsigned int)(hole->iov_len / PAGE_SIZE));
 
+#ifdef DBG
+	printf("\th %p [%u] in page_xfer_dumo_holes in page-xfer.c\n", hole->iov_base,
+			(unsigned int)(hole->iov_len / PAGE_SIZE));
+
+#endif
+
 	if (xfer->write_hole(xfer, hole))
 		return -1;
 
 	return 0;
-}
-
-static struct iovec get_iov(struct iovec *iovs, unsigned int n)
-{
-	return iovs[n];
 }
 
 static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp,
@@ -359,8 +416,8 @@ static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp,
 	int ret;
 
 	for (; *cur_hole < pp->free_hole ; (*cur_hole)++) {
-		struct iovec hole = get_iov(pp->holes, *cur_hole);
-
+		struct iovec hole = pp->holes[*cur_hole];
+	
 		if (limit && hole.iov_base >= limit)
 			break;
 
@@ -373,21 +430,30 @@ static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp,
 }
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp,
-		unsigned long off)
+		unsigned long off, bool write_bypass)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
 	int ret;
+//	struct timeval t1, t2;
+//	unsigned long timecost;
 
 	pr_debug("Transferring pages:\n");
+
+	//printf("Transferring pages:\n");
+
+//	gettimeofday(&t1, NULL);
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
 		unsigned int i;
 
 		pr_debug("\tbuf %d/%d\n", ppb->pages_in, ppb->nr_segs);
+#ifdef DBG
+		printf("\tbuf %d/%d in page_xfer_dump_pages in page-xfer.c\n", ppb->pages_in, ppb->nr_segs);
 
+#endif
 		for (i = 0; i < ppb->nr_segs; i++) {
-			struct iovec iov = get_iov(ppb->iov, i);
+			struct iovec iov = ppb->iov[i];
 
 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base, off);
 			if (ret)
@@ -398,12 +464,27 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp,
 			pr_debug("\tp %p [%u]\n", iov.iov_base,
 					(unsigned int)(iov.iov_len / PAGE_SIZE));
 
-			if (xfer->write_pagemap(xfer, &iov))
+#ifdef DBG
+			printf("\tp %p [%u]\n", iov.iov_base,
+					(unsigned int)(iov.iov_len / PAGE_SIZE));
+#endif
+			if (xfer->write_pagemap(xfer, &iov)){
 				return -1;
-			if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
-				return -1;
+			}
+
+			if(write_bypass == false){
+				if (xfer->write_pages(xfer, ppb->p[0], iov.iov_len)){
+					return -1;
+				}
+			}
 		}
 	}
+
+/*
+	gettimeofday(&t2, NULL);
+	timecost = (t2.tv_sec-t1.tv_sec)*1000000 + (t2.tv_usec - t1.tv_usec);
+	printf("time in normal write: %lu\n", timecost);
+*/
 
 	return dump_holes(xfer, pp, &cur_hole, NULL, off);
 }
@@ -516,7 +597,7 @@ static int page_server_open(int sk, struct page_server_iov *pi)
 
 	page_server_close();
 
-	if (open_page_local_xfer(&cxfer.loc_xfer, type, id))
+	if (open_page_local_xfer(&cxfer.loc_xfer, type, id, true))
 		return -1;
 
 	cxfer.dst_id = pi->dst_id;
@@ -565,6 +646,20 @@ static int page_server_add(int sk, struct page_server_iov *pi)
 		chunk = len;
 		if (chunk > cxfer.pipe_size)
 			chunk = cxfer.pipe_size;
+
+		/*
+		 * Splicing into a pipe may end up blocking if pipe is "full",
+		 * and we need the SPLICE_F_NONBLOCK flag here. At the same time
+		 * splcing from UNIX socket with this flag aborts splice with
+		 * the EAGAIN if there's no data in it (TCP looks at the socket
+		 * O_NONBLOCK flag _only_ and waits for data), so before doing
+		 * the non-blocking splice we need to explicitly wait.
+		 */
+
+		if (sk_wait_data(sk) < 0) {
+			pr_perror("Can't poll socket");
+			return -1;
+		}
 
 		chunk = splice(sk, NULL, cxfer.p[1], NULL, chunk, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
 		if (chunk < 0) {
@@ -726,7 +821,7 @@ int cr_page_server(bool daemon_mode, int cfd)
 no_server:
 	ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
 	if (ret != 0)
-		return ret;
+		return ret > 0 ? 0 : -1;
 
 	if (ask >= 0)
 		ret = page_server_serve(ask);

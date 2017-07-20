@@ -17,19 +17,22 @@
 #include <sys/resource.h>
 #include <signal.h>
 
-#include "compiler.h"
-#include "asm/string.h"
-#include "asm/types.h"
-#include "syscall.h"
+#include "int.h"
+#include "types.h"
+#include "common/compiler.h"
+#include <compel/plugins/std/syscall.h>
+#include <compel/plugins/std/log.h>
+#include <compel/ksigset.h>
+#include "signal.h"
 #include "config.h"
 #include "prctl.h"
-#include "log.h"
+#include "criu-log.h"
 #include "util.h"
 #include "image.h"
 #include "sk-inet.h"
 #include "vma.h"
 
-#include "lock.h"
+#include "common/lock.h"
 #include "restorer.h"
 #include "aio.h"
 #include "seccomp.h"
@@ -38,7 +41,7 @@
 #include "images/mm.pb-c.h"
 
 #include "shmem.h"
-#include "asm/restorer.h"
+#include "restorer.h"
 
 #ifndef PR_SET_PDEATHSIG
 #define PR_SET_PDEATHSIG 1
@@ -58,6 +61,28 @@ static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+static enum faults fi_strategy;
+bool fault_injected(enum faults f)
+{
+	return __fault_injected(f, fi_strategy);
+}
+
+/*
+ * These are stubs for std compel plugin.
+ */
+int parasite_daemon_cmd(int cmd, void *args)
+{
+	return 0;
+}
+
+int parasite_trap_cmd(int cmd, void *args)
+{
+	return 0;
+}
+
+void parasite_cleanup(void)
+{
+}
 
 extern void cr_restore_rt (void) asm ("__cr_restore_rt")
 			__attribute__ ((visibility ("hidden")));
@@ -95,14 +120,14 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 static int lsm_set_label(char *label, int procfd)
 {
 	int ret = -1, len, lsmfd;
-	char path[LOG_SIMPLE_CHUNK];
+	char path[STD_LOG_SIMPLE_CHUNK];
 
 	if (!label)
 		return 0;
 
 	pr_info("restoring lsm profile %s\n", label);
 
-	simple_sprintf(path, "self/task/%ld/attr/current", sys_gettid());
+	std_sprintf(path, "self/task/%ld/attr/current", sys_gettid());
 
 	lsmfd = sys_openat(procfd, path, O_WRONLY, 0);
 	if (lsmfd < 0) {
@@ -397,20 +422,40 @@ die:
 	return -1;
 }
 
+static int restore_robust_futex(struct thread_restore_args *args)
+{
+	uint32_t futex_len = args->futex_rla_len;
+	int ret;
+
+	if (!args->futex_rla_len)
+		return 0;
+
+	/*
+	 * XXX: We check here *task's* mode, not *thread's*.
+	 * But it's possible to write an application with mixed
+	 * threads (on x86): some in 32-bit mode, some in 64-bit.
+	 * Quite unlikely that such application exists at all.
+	 */
+	if (args->ta->compatible_mode) {
+		uint32_t futex = (uint32_t)args->futex_rla;
+		ret = set_compat_robust_list(futex, futex_len);
+	} else {
+		void *futex = decode_pointer(args->futex_rla);
+		ret = sys_set_robust_list(futex, futex_len);
+	}
+
+	if (ret)
+		pr_err("Failed to recover futex robust list: %d\n", ret);
+
+	return ret;
+}
+
 static int restore_thread_common(struct thread_restore_args *args)
 {
 	sys_set_tid_address((int *)decode_pointer(args->clear_tid_addr));
 
-	if (args->has_futex && args->futex_rla_len) {
-		int ret;
-
-		ret = sys_set_robust_list(decode_pointer(args->futex_rla),
-					  args->futex_rla_len);
-		if (ret) {
-			pr_err("Failed to recover futex robust list: %d\n", ret);
-			return -1;
-		}
-	}
+	if (restore_robust_futex(args))
+		return -1;
 
 	restore_sched_info(&args->sp);
 
@@ -422,9 +467,10 @@ static int restore_thread_common(struct thread_restore_args *args)
 	return 0;
 }
 
-static void noinline rst_sigreturn(unsigned long new_sp)
+static void noinline rst_sigreturn(unsigned long new_sp,
+		struct rt_sigframe *sigframe)
 {
-	ARCH_RT_SIGRETURN(new_sp);
+	ARCH_RT_SIGRETURN(new_sp, sigframe);
 }
 
 /*
@@ -483,7 +529,7 @@ long __export_restore_thread(struct thread_restore_args *args)
 	futex_dec_and_wake(&thread_inprogress);
 
 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
-	rst_sigreturn(new_sp);
+	rst_sigreturn(new_sp, rt_sigframe);
 
 core_restore_end:
 	pr_err("Restorer abnormal termination for %ld\n", sys_getpid());
@@ -505,6 +551,14 @@ static long restore_self_exe_late(struct task_restore_args *args)
 	return ret;
 }
 
+#ifndef ARCH_HAS_SHMAT_HOOK
+unsigned long arch_shmat(int shmid, void *shmaddr,
+			int shmflg, unsigned long size)
+{
+	return sys_shmat(shmid, shmaddr, shmflg);
+}
+#endif
+
 static unsigned long restore_mapping(VmaEntry *vma_entry)
 {
 	int prot	= vma_entry->prot;
@@ -513,6 +567,8 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 
 	if (vma_entry_is(vma_entry, VMA_AREA_SYSVIPC)) {
 		int att_flags;
+		void *shmaddr = decode_pointer(vma_entry->start);
+		unsigned long shmsize = (vma_entry->end - vma_entry->start);
 		/*
 		 * See comment in open_shmem_sysv() for what SYSV_SHMEM_SKIP_FD
 		 * means and why we check for PROT_EXEC few lines below.
@@ -527,7 +583,7 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 			att_flags = SHM_RDONLY;
 
 		pr_info("Attach SYSV shmem %d at %"PRIx64"\n", (int)vma_entry->fd, vma_entry->start);
-		return sys_shmat(vma_entry->fd, decode_pointer(vma_entry->start), att_flags);
+		return arch_shmat(vma_entry->fd, shmaddr, att_flags, shmsize);
 	}
 
 	/*
@@ -670,7 +726,7 @@ static int restore_aio_ring(struct rst_aio_ring *raio)
 
 populate:
 	i = offsetof(struct aio_ring, io_events);
-	builtin_memcpy((void *)ctx + i, (void *)ring + i, raio->len - i);
+	memcpy((void *)ctx + i, (void *)ring + i, raio->len - i);
 
 	/*
 	 * If we failed to get the proper nr_req right and
@@ -802,7 +858,7 @@ static int timerfd_arm(struct task_restore_args *args)
 		pr_debug("timerfd: arm for fd %d (%d)\n", t->fd, i);
 
 		if (t->settime_flags & TFD_TIMER_ABSTIME) {
-			struct timespec ts = { };
+			struct timespec ts;
 
 			/*
 			 * We might need to adjust value because the checkpoint
@@ -882,8 +938,6 @@ static void restore_posix_timers(struct task_restore_args *args)
 		sys_timer_settime((kernel_timer_t)rt->spt.it_id, 0, &rt->val, NULL);
 	}
 }
-static void *bootstrap_start;
-static unsigned int bootstrap_len;
 
 /*
  * sys_munmap must not return here. The control process must
@@ -894,6 +948,9 @@ static unsigned long vdso_rt_size;
 #else
 #define vdso_rt_size	(0)
 #endif
+
+void *bootstrap_start = NULL;
+unsigned int bootstrap_len = 0;
 
 void __export_unmap(void)
 {
@@ -1040,6 +1097,8 @@ long __export_restore_task(struct task_restore_args *args)
 	vdso_rt_size	= args->vdso_rt_size;
 #endif
 
+	fi_strategy = args->fault_strategy;
+
 	task_entries_local = args->task_entries;
 	helpers = args->helpers;
 	n_helpers = args->helpers_n;
@@ -1053,16 +1112,29 @@ long __export_restore_task(struct task_restore_args *args)
 	act.rt_sa_restorer = cr_restore_rt;
 	sys_sigaction(SIGCHLD, &act, NULL, sizeof(k_rtsigset_t));
 
-	log_set_fd(args->logfd);
-	log_set_loglevel(args->loglevel);
+	ksigemptyset(&to_block);
+	ksigaddset(&to_block, SIGCHLD);
+	ret = sys_sigprocmask(SIG_UNBLOCK, &to_block, NULL, sizeof(k_rtsigset_t));
+
+	std_log_set_fd(args->logfd);
+	std_log_set_loglevel(args->loglevel);
+	std_log_set_start(&args->logstart);
 
 	pr_info("Switched to the restorer %d\n", my_pid);
 
-	if (vdso_do_park(&args->vdso_sym_rt, args->vdso_rt_parked_at, vdso_rt_size))
-		goto core_restore_end;
+	if (!args->compatible_mode) {
+		/* Compatible vDSO will be mapped, not moved */
+		if (vdso_do_park(&args->vdso_sym_rt,
+				args->vdso_rt_parked_at, vdso_rt_size))
+			goto core_restore_end;
+	}
 
 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len,
 				bootstrap_start, bootstrap_len, args->task_size))
+		goto core_restore_end;
+
+	/* Map compatible vdso */
+	if (args->compatible_mode && vdso_map_compat(args->vdso_rt_parked_at))
 		goto core_restore_end;
 
 	/* Shift private vma-s to the left */
@@ -1125,16 +1197,10 @@ long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * Proxify vDSO.
 	 */
-	for (i = 0; i < args->vmas_n; i++) {
-		if (vma_entry_is(&args->vmas[i], VMA_AREA_VDSO) ||
-		    vma_entry_is(&args->vmas[i], VMA_AREA_VVAR)) {
-			if (vdso_proxify("dumpee", &args->vdso_sym_rt,
-					 args->vdso_rt_parked_at,
-					 i, args->vmas, args->vmas_n))
-				goto core_restore_end;
-			break;
-		}
-	}
+	if (vdso_proxify(&args->vdso_sym_rt, args->vdso_rt_parked_at,
+		     args->vmas, args->vmas_n, args->compatible_mode,
+		     fault_injected(FI_VDSO_TRAMPOLINES)))
+		goto core_restore_end;
 #endif
 
 	/*
@@ -1243,8 +1309,11 @@ long __export_restore_task(struct task_restore_args *args)
 		 * new ones from image file.
 		 */
 		ret |= restore_self_exe_late(args);
-	} else
+	} else {
+		if (ret)
+			pr_err("sys_prctl(PR_SET_MM, PR_SET_MM_MAP) failed with %d\n", (int)ret);
 		sys_close(args->fd_exe_link);
+	}
 
 	if (ret)
 		goto core_restore_end;
@@ -1281,7 +1350,7 @@ long __export_restore_task(struct task_restore_args *args)
 	if (args->nr_threads > 1) {
 		struct thread_restore_args *thread_args = args->thread_args;
 		long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND	|
-				   CLONE_THREAD | CLONE_SYSVSEM;
+				   CLONE_THREAD | CLONE_SYSVSEM | CLONE_FS;
 		long last_pid_len;
 		long parent_tid;
 		int i, fd;
@@ -1307,7 +1376,7 @@ long __export_restore_task(struct task_restore_args *args)
 				continue;
 
 			new_sp = restorer_stack(thread_args[i].mz);
-			last_pid_len = vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
+			last_pid_len = std_vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
 			sys_lseek(fd, 0, SEEK_SET);
 			ret = sys_write(fd, s, last_pid_len);
 			if (ret < 0) {
@@ -1366,7 +1435,20 @@ long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 	}
 
-	sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
+	if (!args->compatible_mode) {
+		sys_sigaction(SIGCHLD, &args->sigchld_act,
+				NULL, sizeof(k_rtsigset_t));
+	} else {
+		void *stack = alloc_compat_syscall_stack();
+
+		if (!stack) {
+			pr_err("Failed to allocate 32-bit stack for sigaction\n");
+			goto core_restore_end;
+		}
+		arch_compat_rt_sigaction(stack, SIGCHLD,
+				(void*)&args->sigchld_act);
+		free_compat_syscall_stack(stack);
+	}
 
 	ret = restore_signals(args->siginfo, args->siginfo_n, true);
 	if (ret)
@@ -1407,7 +1489,7 @@ long __export_restore_task(struct task_restore_args *args)
 	futex_wait_while_gt(&thread_inprogress, 1);
 
 	sys_close(args->proc_fd);
-	log_set_fd(-1);
+	std_log_set_fd(-1);
 
 	/*
 	 * The code that prepared the itimers makes shure the
@@ -1439,11 +1521,22 @@ long __export_restore_task(struct task_restore_args *args)
 	 * pure assembly since we don't need any additional
 	 * code insns from gcc.
 	 */
-	rst_sigreturn(new_sp);
+	rst_sigreturn(new_sp, rt_sigframe);
 
 core_restore_end:
 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
 	pr_err("Restorer fail %ld\n", sys_getpid());
 	sys_exit_group(1);
 	return -1;
+}
+
+/*
+ * For most of the restorer's objects -fstack-protector is disabled.
+ * But we share some of them with CRIU, which may have it enabled.
+ */
+void __stack_chk_fail(void)
+{
+	pr_err("Restorer stack smash detected %ld\n", sys_getpid());
+	sys_exit_group(1);
+	BUG();
 }

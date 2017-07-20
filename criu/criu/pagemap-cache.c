@@ -1,8 +1,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include "page.h"
 #include "pagemap-cache.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "xmalloc.h"
 #include "util.h"
 #include "log.h"

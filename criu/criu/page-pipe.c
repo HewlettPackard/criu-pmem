@@ -1,12 +1,22 @@
 #include <unistd.h>
-#include <fcntl.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-pipe: "
 
+#include "page.h"
 #include "config.h"
 #include "util.h"
+#include "criu-log.h"
 #include "page-pipe.h"
+#include "fcntl.h"
+#include "mem.h"
+#include "cr_options.h"
+
+
+/* http://man7.org/linux/man-pages/man2/write.2.html  */
+#define  LINUX_MAX_WRITE_SIZE  (2147479552)
+
+
 
 /* can existing iov accumulate the page? */
 static inline bool iov_grow_page(struct iovec *iov, unsigned long addr)
@@ -82,6 +92,7 @@ static int ppb_resize_pipe(struct page_pipe_buf *ppb, unsigned long new_size)
 static int page_pipe_grow(struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
+	struct iovec *free_iov;
 
 	pr_debug("Will grow page pipe (iov off is %u)\n", pp->free_iov);
 
@@ -99,7 +110,8 @@ static int page_pipe_grow(struct page_pipe *pp)
 		return -1;
 
 out:
-	ppb_init(ppb, 0, 0, &pp->iovs[pp->free_iov]);
+	free_iov = &pp->iovs[pp->free_iov];
+	ppb_init(ppb, 0, 0, free_iov);
 
 	return 0;
 }
@@ -181,32 +193,61 @@ void page_pipe_reinit(struct page_pipe *pp)
 }
 
 static inline int try_add_page_to(struct page_pipe *pp, struct page_pipe_buf *ppb,
-		unsigned long addr)
+		unsigned long addr, bool pre_dump)
 {
-	if (ppb->pages_in == ppb->pipe_size) {
-		unsigned long new_size = ppb->pipe_size << 1;
-		int ret;
+	int page_size = getpagesize();
 
-		if (new_size > PIPE_MAX_SIZE)
-			return 1;
 
-		ret = ppb_resize_pipe(ppb, new_size);
-		if (ret < 0)
-			return 1; /* need to add another buf */
+	if((opts.use_pmem == true)&&(pre_dump == false)){
+
+		if (ppb->pages_in == LINUX_MAX_WRITE_SIZE/page_size){
+//			printf("reach max pages in try_add_page_to\n");
+			return -EAGAIN;
+		}
+
+		if (ppb->nr_segs) {
+			if (iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr)){
+//				printf("iov_grow_page: true\n");
+				goto out;
+			}
+		}
 	}
+	else
+	{
+		if (ppb->pages_in == ppb->pipe_size) {
+			unsigned long new_size = ppb->pipe_size << 1;
+			int ret;
 
-	if (ppb->nr_segs) {
-		if (iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr))
-			goto out;
+			if (new_size > PIPE_MAX_SIZE)
+				return 1;
 
-		if (ppb->nr_segs == UIO_MAXIOV)
-			/* XXX -- shrink pipe back? */
-			return 1;
+			ret = ppb_resize_pipe(ppb, new_size);
+			if (ret < 0)
+				return 1; /* need to add another buf */
+		}
+
+		if (ppb->nr_segs) {
+			if (iov_grow_page(&ppb->iov[ppb->nr_segs - 1], addr)){
+//				printf("iov_grow_page: true\n");
+				goto out;
+			}
+
+			if (ppb->nr_segs == UIO_MAXIOV)
+				/* XXX -- shrink pipe back? */
+				return 1;
+		}
 	}
 
 	pr_debug("Add iov to page pipe (%u iovs, %u/%u total)\n",
 			ppb->nr_segs, pp->free_iov, pp->nr_iovs);
+
+
+	//printf("Add iov to page pipe (%u iovs, %u/%u total) in try_add_page_to\n",
+	//		ppb->nr_segs, pp->free_iov, pp->nr_iovs);
+
+
 	iov_init(&ppb->iov[ppb->nr_segs++], addr);
+
 	pp->free_iov++;
 	BUG_ON(pp->free_iov > pp->nr_iovs);
 out:
@@ -214,17 +255,17 @@ out:
 	return 0;
 }
 
-static inline int try_add_page(struct page_pipe *pp, unsigned long addr)
+static inline int try_add_page(struct page_pipe *pp, unsigned long addr, bool pre_dump)
 {
 	BUG_ON(list_empty(&pp->bufs));
-	return try_add_page_to(pp, list_entry(pp->bufs.prev, struct page_pipe_buf, l), addr);
+	return try_add_page_to(pp, list_entry(pp->bufs.prev, struct page_pipe_buf, l), addr, pre_dump);
 }
 
-int page_pipe_add_page(struct page_pipe *pp, unsigned long addr)
+int page_pipe_add_page(struct page_pipe *pp, unsigned long addr, bool pre_dump)
 {
 	int ret;
 
-	ret = try_add_page(pp, addr);
+	ret = try_add_page(pp, addr, pre_dump);
 	if (ret <= 0)
 		return ret;
 
@@ -232,7 +273,7 @@ int page_pipe_add_page(struct page_pipe *pp, unsigned long addr)
 	if (ret < 0)
 		return ret;
 
-	ret = try_add_page(pp, addr);
+	ret = try_add_page(pp, addr, pre_dump);
 	BUG_ON(ret > 0);
 	return ret;
 }
@@ -255,6 +296,7 @@ int page_pipe_add_hole(struct page_pipe *pp, unsigned long addr)
 		goto out;
 
 	iov_init(&pp->holes[pp->free_hole++], addr);
+
 out:
 	return 0;
 }
@@ -276,7 +318,8 @@ void debug_show_page_pipe(struct page_pipe *pp)
 				ppb->pages_in, ppb->nr_segs);
 		for (i = 0; i < ppb->nr_segs; i++) {
 			iov = &ppb->iov[i];
-			pr_debug("\t\t%p %lu\n", iov->iov_base, iov->iov_len / PAGE_SIZE);
+			pr_debug("\t\t%p %lu\n", iov->iov_base,
+					iov->iov_len / PAGE_SIZE);
 		}
 	}
 

@@ -1,4 +1,4 @@
-#include "asm/bitsperlong.h"
+#include "common/bitsperlong.h"
 
 #define BIT_WORD(nr)		((nr) / BITS_PER_LONG)
 

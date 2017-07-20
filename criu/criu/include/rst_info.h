@@ -1,8 +1,8 @@
 #ifndef __CR_RST_INFO_H__
 #define __CR_RST_INFO_H__
 
-#include "lock.h"
-#include "list.h"
+#include "common/lock.h"
+#include "common/list.h"
 #include "vma.h"
 
 struct task_entries {
@@ -26,11 +26,7 @@ struct fdt {
 struct _MmEntry;
 
 struct rst_info {
-	struct list_head	used;
 	struct list_head	fds;
-	struct list_head	eventpoll;
-	struct list_head	tty_slaves;
-	struct list_head	tty_ctty;
 
 	void			*premmapped_addr;
 	unsigned long		premmapped_len;

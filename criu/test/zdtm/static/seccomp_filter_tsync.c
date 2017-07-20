@@ -190,7 +190,7 @@ int main(int argc, char ** argv)
 	}
 
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		pr_perror("expected 0 exit, got %d\n", WEXITSTATUS(status));
+		pr_err("expected 0 exit, got %d\n", WEXITSTATUS(status));
 		exit(1);
 	}
 
@@ -209,6 +209,7 @@ err:
 
 #else /* __NR_seccomp */
 
+#define TEST_SKIP_REASON "incompatible kernel (no seccomp)"
 #include "skip-me.c"
 
 #endif /* __NR_seccomp */

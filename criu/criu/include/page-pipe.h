@@ -2,7 +2,28 @@
 #define __CR_PAGE_PIPE_H__
 
 #include <sys/uio.h>
-#include "list.h"
+#include "common/list.h"
+
+#define PAGE_ALLOC_COSTLY_ORDER 3 /* from the kernel source code */
+struct kernel_pipe_buffer {
+        struct page *page;
+        unsigned int offset, len;
+        const struct pipe_buf_operations *ops;
+        unsigned int flags;
+        unsigned long private;
+};
+
+/*
+ * The kernel allocates the linear chunk of memory for pipe buffers.
+ * Allocation of chunks with size more than PAGE_ALLOC_COSTLY_ORDER
+ * fails very often, so we need to restrict the pipe capacity to not
+ * allocate big chunks.
+ */
+#define PIPE_MAX_SIZE ((1 << PAGE_ALLOC_COSTLY_ORDER) * PAGE_SIZE /	\
+			sizeof(struct kernel_pipe_buffer))
+
+/* The number of pipes for one chunk */
+#define NR_PIPES_PER_CHUNK 8
 
 /*
  * page_pipe is a descriptor of task's virtual memory
@@ -95,12 +116,11 @@ struct page_pipe {
 
 #define PP_CHUNK_MODE	0x1	/* Restrict the maximum buffer size of pipes
 				   and dump memory for a few iterations */
-#define PP_COMPAT	0x2	/* Use compatible iovs (struct compat_iovec) */
 #define PP_OWN_IOVS	0x4	/* create_page_pipe allocated IOVs memory */
 
 struct page_pipe *create_page_pipe(unsigned int nr_segs, struct iovec *iovs, unsigned flags);
 extern void destroy_page_pipe(struct page_pipe *p);
-extern int page_pipe_add_page(struct page_pipe *p, unsigned long addr);
+extern int page_pipe_add_page(struct page_pipe *p, unsigned long addr, bool pre_dump);
 extern int page_pipe_add_hole(struct page_pipe *p, unsigned long addr);
 
 extern void debug_show_page_pipe(struct page_pipe *pp);

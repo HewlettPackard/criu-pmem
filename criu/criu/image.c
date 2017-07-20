@@ -1,6 +1,8 @@
+#include <stdio.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include "crtools.h"
 #include "cr_options.h"
@@ -11,6 +13,7 @@
 #include "cgroup.h"
 #include "lsm.h"
 #include "protobuf.h"
+#include "xmalloc.h"
 #include "images/inventory.pb-c.h"
 #include "images/pagemap.pb-c.h"
 
@@ -19,6 +22,13 @@ bool img_common_magic = true;
 TaskKobjIdsEntry *root_ids;
 u32 root_cg_set;
 Lsmtype image_lsm;
+
+
+//#define TEST
+
+static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long flags, char *path);
+
+
 
 int check_img_inventory(void)
 {
@@ -57,7 +67,10 @@ int check_img_inventory(void)
 		root_cg_set = he->root_cg_set;
 	}
 
-	image_lsm = he->lsmtype;
+	if (he->has_lsmtype)
+		image_lsm = he->lsmtype;
+	else
+		image_lsm = LSMTYPE__NO_LSM;
 
 	switch (he->img_version) {
 	case CRTOOLS_IMAGES_V1:
@@ -101,10 +114,11 @@ int write_img_inventory(InventoryEntry *he)
 
 int prepare_inventory(InventoryEntry *he)
 {
+	struct pid pid;
 	struct {
 		struct pstree_item i;
 		struct dmp_info d;
-	} crt = { };
+	} crt = { .i.pid = &pid };
 
 	pr_info("Perparing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
 
@@ -113,10 +127,11 @@ int prepare_inventory(InventoryEntry *he)
 	he->has_fdinfo_per_id = true;
 	he->ns_per_id = true;
 	he->has_ns_per_id = true;
+	he->has_lsmtype = true;
 	he->lsmtype = host_lsm_type();
 
-	crt.i.pid.state = TASK_ALIVE;
-	crt.i.pid.real = getpid();
+	crt.i.pid->state = TASK_ALIVE;
+	crt.i.pid->real = getpid();
 	if (get_task_ids(&crt.i))
 		return -1;
 
@@ -220,7 +235,6 @@ struct cr_imgset *cr_glob_imgset_open(int mode)
 	return cr_imgset_open(-1 /* ignored */, GLOB, mode);
 }
 
-static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long flags, char *path);
 
 struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 {
@@ -245,15 +259,24 @@ struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 	vsnprintf(path, PATH_MAX, imgset_template[type].fmt, args);
 	va_end(args);
 
+	// path only includes file names like core-2123.img or pages-1.img
+
 	if (lazy) {
 		img->fd = LAZY_IMG_FD;
 		img->type = type;
 		img->oflags = oflags;
 		img->path = xstrdup(path);
 		return img;
-	} else
+	} else{
+		// only pages images and irmap-cache  are not lazy
 		img->fd = EMPTY_IMG_FD;
 
+		if(dfd == -2){
+			img->page_img_path = xstrdup(path); // save file name here
+		}
+	}
+
+	// only page images and irmap-cache go here
 	if (do_open_image(img, dfd, type, oflags, path)) {
 		close_image(img);
 		return NULL;
@@ -311,19 +334,30 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 
 	flags = oflags & ~(O_NOBUF | O_SERVICE);
 
-	ret = openat(dfd, path, flags, CR_FD_PERM);
-	if (ret < 0) {
-		if (!(flags & O_CREAT) && (errno == ENOENT)) {
-			pr_info("No %s image\n", path);
-			img->_x.fd = EMPTY_IMG_FD;
-			goto skip_magic;
+	//printf("dfd in do_open_image: %d and path: %s\n", dfd, path);
+
+	if(dfd != -2){
+		ret = openat(dfd, path, flags, CR_FD_PERM);
+		if (ret < 0) {
+			if (!(flags & O_CREAT) && (errno == ENOENT)) {
+				pr_info("No %s image\n", path);
+				img->_x.fd = EMPTY_IMG_FD;
+				goto skip_magic;
+			}
+
+			pr_perror("Unable to open %s", path);
+			goto err;
 		}
 
-		pr_perror("Unable to open %s", path);
-		goto err;
+		img->_x.fd = ret;
+	}
+	else{	
+		img->_x.fd = -1; // no open file 
 	}
 
-	img->_x.fd = ret;
+	
+//printf("i am 1\n");
+
 	if (oflags & O_NOBUF)
 		bfd_setraw(&img->_x);
 	else {
@@ -345,7 +379,7 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		ret = img_write_magic(img, oflags, type);
 	if (ret)
 		goto err;
-
+//printf("i am 2\n");
 skip_magic:
 	return 0;
 
@@ -361,6 +395,8 @@ int open_image_lazy(struct cr_img *img)
 	img->path = NULL;
 
 	dfd = get_service_fd(IMG_FD_OFF);
+
+	//printf("open image lazy with dfd:%d\n", dfd);
 	if (do_open_image(img, dfd, img->type, img->oflags, path)) {
 		xfree(path);
 		return -1;
@@ -453,29 +489,60 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
-struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi)
-{
-	unsigned id;
 
+static void __get_pages_image_path(int type, char *path, ...)
+{
+	va_list args;
+	unsigned int len;
+
+	len = strlen(get_current_dir_name());
+
+	memcpy(path, get_current_dir_name(), len);
+	path[len] = '/';
+
+	va_start(args, path);
+	vsnprintf(path+len+1, PATH_MAX-len-1, imgset_template[type].fmt, args);
+	va_end(args);
+}
+
+
+
+void get_pages_image_path(char *path){
+	int shift = 0;
+
+#ifdef TEST
+	shift = 100;
+#endif
+	__get_pages_image_path(CR_FD_PAGES, path, page_ids+shift);
+}
+
+
+
+struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+{
 	if (flags == O_RDONLY || flags == O_RDWR) {
 		PagemapHead *h;
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
-		id = h->pages_id;
+		*id = h->pages_id;
 		pagemap_head__free_unpacked(h, NULL);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
-		id = h.pages_id = page_ids++;
+		*id = h.pages_id = page_ids++;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;
 	}
 
-	return open_image_at(dfd, CR_FD_PAGES, flags, id);
+	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
 }
 
-struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi)
+
+struct cr_img *open_pages_image(bool do_open, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	return open_pages_image_at(get_service_fd(IMG_FD_OFF), flags, pmi);
+	if(do_open == true)
+		return open_pages_image_at(get_service_fd(IMG_FD_OFF), flags, pmi, id);
+	else
+		return open_pages_image_at(-2, flags, pmi, id);
 }
 
 /*
@@ -572,7 +639,7 @@ off_t img_raw_size(struct cr_img *img)
 	struct stat stat;
 
 	if (fstat(img->_x.fd, &stat)) {
-		pr_perror("Failed to get image stats\n");
+		pr_perror("Failed to get image stats");
 		return -1;
 	}
 

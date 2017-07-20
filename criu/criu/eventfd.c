@@ -12,8 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 
-#include "compiler.h"
-#include "asm/types.h"
+#include "common/compiler.h"
 #include "imgset.h"
 #include "eventfd.h"
 #include "fdinfo.h"
@@ -80,7 +79,7 @@ const struct fdtype_ops eventfd_dump_ops = {
 	.dump		= dump_one_eventfd,
 };
 
-static int eventfd_open(struct file_desc *d)
+static int eventfd_open(struct file_desc *d, int *new_fd)
 {
 	struct eventfd_file_info *info;
 	int tmp;
@@ -100,7 +99,8 @@ static int eventfd_open(struct file_desc *d)
 		goto err_close;
 	}
 
-	return tmp;
+	*new_fd = tmp;
+	return 0;
 
 err_close:
 	close(tmp);

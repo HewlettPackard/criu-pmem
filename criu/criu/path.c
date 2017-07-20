@@ -1,9 +1,12 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 
+#include "int.h"
 #include "mount.h"
 #include "path.h"
-#include "bug.h"
+#include "log.h"
+#include "common/bug.h"
 
 char *cut_root_for_bind(char *target_root, char *source_root)
 {
@@ -72,10 +75,11 @@ char *mnt_get_sibling_path(struct mount_info *m,
 	cut_root = cut_root_for_bind(pa->root, p->root);
 	if (cut_root == NULL)
 		return NULL;
-	if (p->mountpoint[1] != 0) /* not "/" */
+	if (p->mountpoint[1] != 0) /* not "/" */ {
 		off = snprintf(path, len, "%s", p->mountpoint);
-	if (path[off - 1] == '/') /* p->mountpoint = "./" */
-		off--;
+		if (path[off - 1] == '/') /* p->mountpoint = "./" */
+			off--;
+	}
 	len -= off;
 	path += off;
 
@@ -94,7 +98,8 @@ char *mnt_get_sibling_path(struct mount_info *m,
 	if (rpath[0] == '/')
 		rpath++;
 
-	off = snprintf(path, len, "/%s", rpath);
+	if (rpath[0] != '\0')
+		off = snprintf(path, len, "/%s", rpath);
 
 	return buf;
 }

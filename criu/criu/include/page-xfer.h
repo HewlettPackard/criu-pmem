@@ -35,10 +35,10 @@ struct page_xfer {
 	struct page_read *parent;
 };
 
-extern int open_page_xfer(struct page_xfer *xfer, int fd_type, long id);
+extern int open_page_xfer(struct page_xfer *xfer, int fd_type, long id, bool must_open);
 struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *,
-				unsigned long off);
+				unsigned long off, bool write_bypass);
 extern int connect_to_page_server(void);
 extern int disconnect_from_page_server(void);
 

@@ -3,13 +3,14 @@
 
 #include <stdbool.h>
 
-#include "compiler.h"
+#include "common/compiler.h"
 #include "servicefd.h"
 #include "image-desc.h"
 #include "fcntl.h"
 #include "magic.h"
 #include "bfd.h"
-#include "bug.h"
+#include "log.h"
+#include "common/bug.h"
 
 #ifdef _ARCH_PPC64
 #define PAGE_IMAGE_SIZE	65536
@@ -113,6 +114,7 @@ struct cr_img {
 			int type;
 			unsigned long oflags;
 			char *path;
+			char *page_img_path; // jay to store image path
 		};
 	};
 };
@@ -149,8 +151,8 @@ extern void close_image_dir(void);
 extern struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...);
 #define open_image(typ, flags, ...) open_image_at(-1, typ, flags, ##__VA_ARGS__)
 extern int open_image_lazy(struct cr_img *img);
-extern struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi);
-extern struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi);
+extern struct cr_img *open_pages_image(bool do_open, unsigned long flags, struct cr_img *pmi, u32 *pages_id);
+extern struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *pages_id);
 extern void up_page_ids_base(void);
 
 extern struct cr_img *img_from_fd(int fd); /* for cr-show mostly */

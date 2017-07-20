@@ -4,9 +4,6 @@
 #include <stdbool.h>
 #include <sys/socket.h>
 
-#include "asm/types.h"
-
-#include "protobuf.h"
 #include "images/sk-opts.pb-c.h"
 
 struct fdinfo_list_entry;
@@ -29,7 +26,7 @@ extern int dump_socket_opts(int sk, SkOptsEntry *soe);
 extern int restore_socket_opts(int sk, SkOptsEntry *soe);
 extern void release_skopts(SkOptsEntry *);
 extern int restore_prepare_socket(int sk);
-extern void preload_socket_modules();
+extern void preload_socket_modules(void);
 
 extern bool socket_test_collect_bit(unsigned int family, unsigned int proto);
 
@@ -54,7 +51,7 @@ extern int inet_collect_one(struct nlmsghdr *h, int family, int type);
 extern int unix_receive_one(struct nlmsghdr *h, void *);
 extern int netlink_receive_one(struct nlmsghdr *hdr, void *arg);
 
-extern int unix_sk_id_add(ino_t ino);
+extern int unix_sk_id_add(unsigned int ino);
 extern int unix_sk_ids_parse(char *optarg);
 
 extern int do_dump_opt(int sk, int level, int name, void *val, int len);

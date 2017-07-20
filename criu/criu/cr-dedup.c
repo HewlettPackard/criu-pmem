@@ -3,6 +3,7 @@
 #include <linux/falloc.h>
 #include <unistd.h>
 
+#include "int.h"
 #include "crtools.h"
 #include "pagemap.h"
 #include "restorer.h"
@@ -71,7 +72,6 @@ static int cr_dedup_one_pagemap(int id, int flags)
 	int ret;
 	struct page_read pr;
 	struct page_read * prp;
-	struct iovec iov;
 
 	flags |= PR_MOD;
 	ret = open_page_read(id, &pr, flags);
@@ -82,22 +82,19 @@ static int cr_dedup_one_pagemap(int id, int flags)
 	if (!prp)
 		goto exit;
 
-	ret = pr.get_pagemap(&pr, &iov);
-	if (ret <= 0)
-		goto exit;
-
 	while (1) {
-		pr_debug("dedup iovec base=%p, len=%zu\n", iov.iov_base, iov.iov_len);
+		ret = pr.advance(&pr);
+		if (ret <= 0)
+			goto exit;
+
+		pr_debug("dedup iovec base=%"PRIx64", len=%lu\n",
+			 pr.pe->vaddr, pagemap_len(pr.pe));
 		if (!pr.pe->in_parent) {
-			ret = dedup_one_iovec(prp, &iov);
+			ret = dedup_one_iovec(prp, pr.pe->vaddr,
+					      pagemap_len(pr.pe));
 			if (ret)
 				goto exit;
 		}
-
-		pr.put_pagemap(&pr);
-		ret = pr.get_pagemap(&pr, &iov);
-		if (ret <= 0)
-			goto exit;
 	}
 exit:
 	pr.close(&pr);

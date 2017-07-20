@@ -4,6 +4,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define INPROGRESS ".inprogress"
+
 #ifndef PAGE_SIZE
 # define PAGE_SIZE (unsigned int)(sysconf(_SC_PAGESIZE))
 #endif
@@ -72,7 +74,8 @@ extern void __push_opt(struct long_opt *opt);
 	static struct long_opt __long_opt_##name = {				\
 		#name, #type, doc, is_required, parse_opt_##type, &name };	\
 	static void __init_opt_##name(void) __attribute__ ((constructor));	\
-	static void __init_opt_##name(void) { __push_opt(&__long_opt_##name); }
+	static void __init_opt_##name(void) \
+	{ (void)__check_##name; __push_opt(&__long_opt_##name); }
 
 #define __param_check(name, p, type) \
 	static inline type *__check_##name(void) { return(p); }
@@ -138,5 +141,4 @@ extern int tcp_init_server(int family, int *port);
 extern int tcp_accept_server(int sock);
 extern int tcp_init_client(int family, char *servIP, unsigned short servPort);
 
-extern int get_smaps_bits(unsigned long where, unsigned long *flags, unsigned long *madv);
 #endif /* _VIMITESU_H_ */

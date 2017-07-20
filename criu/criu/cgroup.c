@@ -7,19 +7,19 @@
 #include <sys/stat.h>
 #include <ftw.h>
 #include <libgen.h>
-#include "list.h"
+#include <sched.h>
+#include "common/list.h"
 #include "xmalloc.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "cr_options.h"
 #include "pstree.h"
+#include "criu-log.h"
 #include "util.h"
 #include "imgset.h"
 #include "util-pie.h"
 #include "namespaces.h"
 #include "seize.h"
-#include "syscall-types.h"
-#include "parasite.h"
 #include "protobuf.h"
 #include "images/core.pb-c.h"
 #include "images/cgroup.pb-c.h"
@@ -422,12 +422,12 @@ static int add_cgroup_properties(const char *fpath, struct cgroup_dir *ncd,
 		const cgp_t *cgp = cgp_get_props(controller->controllers[i]);
 
 		if (dump_cg_props_array(fpath, ncd, cgp) < 0) {
-			pr_err("dumping known properties failed");
+			pr_err("dumping known properties failed\n");
 			return -1;
 		}
 
 		if (dump_cg_props_array(fpath, ncd, &cgp_global) < 0) {
-			pr_err("dumping global properties failed");
+			pr_err("dumping global properties failed\n");
 			return -1;
 		}
 	}
@@ -545,9 +545,10 @@ static int collect_cgroups(struct list_head *ctls)
 	int fd = -1;
 
 	list_for_each_entry(cc, ctls, l) {
-		char path[PATH_MAX], mopts[1024];
+		char path[PATH_MAX], mopts[1024], *root;
 		char prefix[] = ".criu.cgmounts.XXXXXX";
 		struct cg_controller *cg;
+		struct cg_root_opt *o;
 
 		current_controller = NULL;
 
@@ -567,7 +568,11 @@ static int collect_cgroups(struct list_head *ctls)
 				pr_err("controller %s not found\n", cc->name);
 				return -1;
 			} else {
-				struct cg_controller *nc = new_controller(cc->name);
+				struct cg_controller *nc;
+
+				nc = new_controller(cc->name);
+				if (!nc)
+					return -1;
 				list_add_tail(&nc->l, &cg->l);
 				n_cgroups++;
 				current_controller = nc;
@@ -598,7 +603,17 @@ static int collect_cgroups(struct list_head *ctls)
 			return -1;
 
 		path_pref_len = snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-		snprintf(path + path_pref_len, PATH_MAX - path_pref_len, "%s", cc->path);
+
+		root = cc->path;
+		if (opts.new_global_cg_root)
+			root = opts.new_global_cg_root;
+
+		list_for_each_entry(o, &opts.new_cgroup_roots, node) {
+			if (!strcmp(cc->name, o->controller))
+				root = o->newroot;
+		}
+
+		snprintf(path + path_pref_len, PATH_MAX - path_pref_len, "%s", root);
 
 		ret = ftw(path, add_cgroup, 4);
 		if (ret < 0)
@@ -625,7 +640,7 @@ int dump_task_cgroup(struct pstree_item *item, u32 *cg_id, struct parasite_dump_
 	struct cg_set *cs;
 
 	if (item)
-		pid = item->pid.real;
+		pid = item->pid->real;
 	else
 		pid = getpid();
 
@@ -946,6 +961,7 @@ static int ctrl_dir_and_opt(CgControllerEntry *ctl, char *dir, int ds,
 static const char *special_props[] = {
 	"cpuset.cpus",
 	"cpuset.mems",
+	"devices.list",
 	"memory.kmem.limit_in_bytes",
 	"memory.swappiness",
 	"memory.oom_control",
@@ -1053,7 +1069,7 @@ static int move_in_cgroup(CgSetEntry *se, bool setup_cgns)
 	pr_info("Move into %d\n", se->id);
 
 	if (setup_cgns && prepare_cgns(se) < 0) {
-		pr_err("failed preparing cgns");
+		pr_err("failed preparing cgns\n");
 		return -1;
 	}
 
@@ -1319,64 +1335,7 @@ static int prepare_cgroup_dir_properties(char *path, int off, CgroupDirEntry **e
 				if (special)
 					continue;
 
-				/* The devices cgroup must be restored in a
-				 * special way: only the contents of
-				 * devices.list can be read, and it is a
-				 * whitelist of all the devices the cgroup is
-				 * allowed to create. To re-creat this
-				 * whitelist, we first deny everything via
-				 * devices.deny, and then write the list back
-				 * into devices.allow.
-				 *
-				 * Further, we must have a write() call for
-				 * each line, because the kernel only parses
-				 * the first line of any write().
-				 */
-				if (!strcmp(e->properties[j]->name, "devices.list")) {
-					CgroupPropEntry *pe = e->properties[j];
-					char *old_val = pe->value, *old_name = pe->name;
-					int ret;
-					char *pos;
-
-					/* A bit of a fudge here. These are
-					 * write only by owner by default, but
-					 * the container engine could have
-					 * changed the perms. We should come up
-					 * with a better way to restore all of
-					 * this stuff.
-					 */
-					pe->perms->mode = 0200;
-
-					pe->name = "devices.deny";
-					pe->value = "a";
-					ret = restore_cgroup_prop(e->properties[j], path, off2);
-					pe->name = old_name;
-					pe->value = old_val;
-
-					if (ret < 0)
-						return -1;
-
-					pe->name = xstrdup("devices.allow");
-					if (!pe->name) {
-						pe->name = old_name;
-						return -1;
-					}
-					xfree(old_name);
-
-					pos = pe->value;
-					while (*pos) {
-						int offset = next_device_entry(pos);
-						pe->value = pos;
-						ret = restore_cgroup_prop(pe, path, off2);
-						if (ret < 0) {
-							pe->value = old_val;
-							return -1;
-						}
-						pos += offset;
-					}
-					pe->value = old_val;
-
-				} else if (restore_cgroup_prop(e->properties[j], path, off2) < 0) {
+				if (restore_cgroup_prop(e->properties[j], path, off2) < 0) {
 					return -1;
 				}
 
@@ -1435,7 +1394,74 @@ static int restore_special_props(char *paux, size_t off, CgroupDirEntry *e)
 				} else if (!strcmp(prop->name, "memory.oom_control") &&
 						!strcmp(prop->value, "0")) {
 					continue;
-				} else if (restore_cgroup_prop(prop, paux, off) < 0) {
+				}
+
+				if (!strcmp(e->properties[j]->name, "devices.list")) {
+					/* The devices cgroup must be restored in a
+					 * special way: only the contents of
+					 * devices.list can be read, and it is a
+					 * whitelist of all the devices the cgroup is
+					 * allowed to create. To re-creat this
+					 * whitelist, we first deny everything via
+					 * devices.deny, and then write the list back
+					 * into devices.allow.
+					 *
+					 * Further, we must have a write() call for
+					 * each line, because the kernel only parses
+					 * the first line of any write().
+					 */
+					CgroupPropEntry *pe = e->properties[j];
+					char *old_val = pe->value, *old_name = pe->name;
+					int ret;
+					char *pos;
+
+					/* A bit of a fudge here. These are
+					 * write only by owner by default, but
+					 * the container engine could have
+					 * changed the perms. We should come up
+					 * with a better way to restore all of
+					 * this stuff.
+					 */
+					pe->perms->mode = 0200;
+
+					pe->name = "devices.deny";
+					pe->value = "a";
+					ret = restore_cgroup_prop(e->properties[j], paux, off);
+					pe->name = old_name;
+					pe->value = old_val;
+
+					/* an emptry string here means nothing
+					 * is allowed, and the kernel disallows
+					 * writing an "" to devices.allow, so
+					 * let's just keep going.
+					 */
+					if (!strcmp(pe->value, ""))
+						continue;
+
+					if (ret < 0)
+						return -1;
+
+					pe->name = "devices.allow";
+
+					pos = pe->value;
+					while (*pos) {
+						int offset = next_device_entry(pos);
+						pe->value = pos;
+						ret = restore_cgroup_prop(pe, paux, off);
+						if (ret < 0) {
+							pe->name = old_name;
+							pe->value = old_val;
+							return -1;
+						}
+						pos += offset;
+					}
+					pe->value = old_val;
+					pe->name = old_name;
+					continue;
+
+				}
+
+				if (restore_cgroup_prop(prop, paux, off) < 0) {
 					return -1;
 				}
 			}
@@ -1484,7 +1510,7 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 				return -1;
 			}
 
-			if (mkdirpat(cg, paux)) {
+			if (mkdirpat(cg, paux, 0755)) {
 				pr_perror("Can't make cgroup dir %s", paux);
 				return -1;
 			}
@@ -1494,7 +1520,9 @@ static int prepare_cgroup_dirs(char **controllers, int n_controllers, char *paux
 				return -1;
 
 			for (j = 0; j < n_controllers; j++) {
-				if (!strcmp(controllers[j], "cpuset") || !strcmp(controllers[j], "memory")) {
+				if (!strcmp(controllers[j], "cpuset")
+						|| !strcmp(controllers[j], "memory")
+						|| !strcmp(controllers[j], "devices")) {
 					if (restore_special_props(paux, off2, e) < 0) {
 						pr_err("Restoring special cpuset props failed!\n");
 						return -1;
@@ -1684,7 +1712,6 @@ static int rewrite_cgsets(CgroupEntry *cge, char **controllers, int n_controller
 					return -ENOMEM;
 				}
 				xfree(prev);
-				cg->cgns_prefix = strlen(newroot);
 
 				if (!dirnew) {
 					/* -1 because cgns_prefix includes leading "/" */
@@ -1692,6 +1719,7 @@ static int rewrite_cgsets(CgroupEntry *cge, char **controllers, int n_controller
 					if (!dirnew)
 						return -ENOMEM;
 				}
+				cg->cgns_prefix = strlen(newroot);
 			} else {
 				char *prev = cg->path;
 				/*
@@ -1715,8 +1743,10 @@ static int rewrite_cgsets(CgroupEntry *cge, char **controllers, int n_controller
 		}
 	}
 
-	xfree(dir);
-	*dir_name = dirnew;
+	if (dirnew) {
+		xfree(dir);
+		*dir_name = dirnew;
+	}
 	return 0;
 }
 

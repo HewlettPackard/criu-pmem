@@ -3,16 +3,17 @@
 #include <sys/mount.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdbool.h>
 
-#include "compiler.h"
-#include "asm/string.h"
-#include "asm/types.h"
+#include "int.h"
+#include "types.h"
+#include "common/compiler.h"
 #include "fcntl.h"
 #include "log.h"
 #include "util-pie.h"
 
 #ifdef CR_NOGLIBC
-# include "syscall.h"
+# include <compel/plugins/std/syscall.h>
 # define __sys(foo)     sys_##foo
 #else
 # define __sys(foo)     foo

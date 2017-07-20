@@ -2,8 +2,8 @@
 #define __CR_PLUGIN_H__
 
 #include "criu-plugin.h"
-#include "compiler.h"
-#include "list.h"
+#include "common/compiler.h"
+#include "common/list.h"
 
 #define CR_PLUGIN_DEFAULT "/var/lib/criu/"
 

@@ -1,7 +1,7 @@
 #ifndef __FILE_LOCK_H__
 #define __FILE_LOCK_H__
 
-#include "list.h"
+#include "common/list.h"
 
 #include "protobuf.h"
 #include "images/file-lock.pb-c.h"
@@ -9,12 +9,20 @@
 #define FL_UNKNOWN	-1
 #define FL_POSIX	1
 #define FL_FLOCK	2
+#define FL_OFD		4
 
 /* for posix fcntl() and lockf() */
 #ifndef F_RDLCK
 #define F_RDLCK		0
 #define F_WRLCK		1
 #define F_UNLCK		2
+#endif
+
+/* for OFD locks fcntl() */
+#ifndef F_OFD_GETLK
+#define F_OFD_GETLK	36
+#define F_OFD_SETLK	37
+#define F_OFD_SETLKW	38
 #endif
 
 /* operations for bsd flock(), also used by the kernel implementation */

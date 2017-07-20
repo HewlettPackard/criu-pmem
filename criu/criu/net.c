@@ -10,9 +10,12 @@
 #include <sys/wait.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <sys/types.h>
 #include <net/if.h>
 #include <linux/sockios.h>
 #include <libnl3/netlink/msg.h>
+
+#include "../soccr/soccr.h"
 
 #include "imgset.h"
 #include "namespaces.h"
@@ -29,9 +32,23 @@
 #include "string.h"
 #include "sysctl.h"
 #include "kerndat.h"
+#include "util.h"
+#include "external.h"
 
 #include "protobuf.h"
 #include "images/netdev.pb-c.h"
+
+#ifndef IFLA_LINK_NETNSID
+#define IFLA_LINK_NETNSID	37
+#endif
+
+#ifndef RTM_NEWNSID
+#define RTM_NEWNSID		88
+#endif
+
+#ifndef IFLA_MACVLAN_FLAGS
+#define IFLA_MACVLAN_FLAGS 2
+#endif
 
 static int ns_sysfs_fd = -1;
 
@@ -170,6 +187,9 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 	if (n > size)
 		pr_warn("The image contains unknown sysctl-s\n");
 
+	if (opts.weak_sysctls)
+		flags = CTL_FLAGS_OPTIONAL;
+
 	rconf = xmalloc(sizeof(SysctlEntry *) * size);
 	if (!rconf)
 		return -1;
@@ -201,6 +221,7 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 
 		snprintf(path[i], MAX_CONF_OPT_PATH, CONF_OPT_PATH, proto, tgt, devconfs[i]);
 		req[ri].name = path[i];
+		req[ri].flags = flags;
 		switch (conf[i]->type) {
 			case SYSCTL_TYPE__CTL_32:
 				req[ri].type = CTL_32;
@@ -213,7 +234,7 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 				break;
 			case SYSCTL_TYPE__CTL_STR:
 				req[ri].type = CTL_STR(MAX_STR_CONF_LEN);
-				flags |= op == CTL_READ && !strcmp(devconfs[i], "stable_secret")
+				req[ri].flags |= op == CTL_READ && !strcmp(devconfs[i], "stable_secret")
 					? CTL_FLAGS_READ_EIO_SKIP : 0;
 
 				/* skip non-existing sysctl */
@@ -225,7 +246,6 @@ static int net_conf_op(char *tgt, SysctlEntry **conf, int n, int op, char *proto
 			default:
 				continue;
 		}
-		req[ri].flags = flags;
 		rconf[ri] = conf[i];
 		ri++;
 	}
@@ -336,14 +356,14 @@ static int ipv4_conf_op_old(char *tgt, int *conf, int n, int op, int *def_conf)
 	return 0;
 }
 
-int write_netdev_img(NetDeviceEntry *nde, struct cr_imgset *fds)
+int write_netdev_img(NetDeviceEntry *nde, struct cr_imgset *fds, struct nlattr **info)
 {
 	return pb_write_one(img_from_set(fds, CR_FD_NETDEV), nde, PB_NETDEV);
 }
 
 static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 		struct nlattr **tb, struct cr_imgset *fds,
-		int (*dump)(NetDeviceEntry *, struct cr_imgset *))
+		int (*dump)(NetDeviceEntry *, struct cr_imgset *, struct nlattr **info))
 {
 	int ret = -1;
 	int i;
@@ -353,6 +373,7 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 	SysctlEntry *confs6 = NULL;
 	int size6 = ARRAY_SIZE(devconfs6);
 	char stable_secret[MAX_STR_CONF_LEN + 1] = {};
+	struct nlattr *info[IFLA_INFO_MAX + 1], **arg = NULL;
 
 	if (!tb[IFLA_IFNAME]) {
 		pr_err("No name for link %d\n", ifi->ifi_index);
@@ -420,7 +441,16 @@ static int dump_one_netdev(int type, struct ifinfomsg *ifi,
 	if (!dump)
 		dump = write_netdev_img;
 
-	ret = dump(&netdev, fds);
+	if (tb[IFLA_LINKINFO]) {
+		ret = nla_parse_nested(info, IFLA_INFO_MAX, tb[IFLA_LINKINFO], NULL);
+		if (ret < 0) {
+			pr_err("failed to parse nested linkinfo\n");
+			return -1;
+		}
+		arg = info;
+	}
+
+	ret = dump(&netdev, fds, arg);
 err_free:
 	xfree(netdev.conf4);
 	xfree(confs4);
@@ -462,7 +492,7 @@ static int dump_unknown_device(struct ifinfomsg *ifi, char *kind,
 	return -1;
 }
 
-static int dump_bridge(NetDeviceEntry *nde, struct cr_imgset *imgset)
+static int dump_bridge(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr **info)
 {
 	char spath[IFNAMSIZ + 16]; /* len("class/net//brif") + 1 for null */
 	int ret, fd;
@@ -494,7 +524,38 @@ static int dump_bridge(NetDeviceEntry *nde, struct cr_imgset *imgset)
 		return -1;
 	}
 
-	return write_netdev_img(nde, imgset);
+	return write_netdev_img(nde, imgset, info);
+}
+
+static int dump_macvlan(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr **info)
+{
+	MacvlanLinkEntry macvlan = MACVLAN_LINK_ENTRY__INIT;
+	int ret;
+	struct nlattr *data[IFLA_MACVLAN_FLAGS+1];
+
+	if (!info || !info[IFLA_INFO_DATA]) {
+		pr_err("no data for macvlan\n");
+		return -1;
+	}
+
+	ret = nla_parse_nested(data, IFLA_MACVLAN_FLAGS, info[IFLA_INFO_DATA], NULL);
+	if (ret < 0) {
+		pr_err("failed ot parse macvlan data\n");
+		return -1;
+	}
+
+	if (!data[IFLA_MACVLAN_MODE]) {
+		pr_err("macvlan mode required for %s\n", nde->name);
+		return -1;
+	}
+
+	macvlan.mode = *((u32 *)RTA_DATA(data[IFLA_MACVLAN_MODE]));
+
+	if (data[IFLA_MACVLAN_FLAGS])
+		macvlan.flags = *((u16 *) RTA_DATA(data[IFLA_MACVLAN_FLAGS]));
+
+	nde->macvlan = &macvlan;
+	return write_netdev_img(nde, imgset, info);
 }
 
 static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
@@ -529,6 +590,8 @@ static int dump_one_ethernet(struct ifinfomsg *ifi, char *kind,
 
 		pr_warn("GRE tap device %s not supported natively\n", name);
 	}
+	if (!strcmp(kind, "macvlan"))
+		return dump_one_netdev(ND_TYPE__MACVLAN, ifi, tb, fds, dump_macvlan);
 
 	return dump_unknown_device(ifi, kind, tb, fds);
 }
@@ -830,34 +893,49 @@ struct newlink_req {
 	char buf[1024];
 };
 
-static int do_rtm_link_req(int msg_type, NetDeviceEntry *nde, int nlsk,
-		int (*link_info)(NetDeviceEntry *, struct newlink_req *))
+/* Optional extra things to be provided at the top level of the NEWLINK
+ * request.
+ */
+struct newlink_extras {
+	int link;		/* IFLA_LINK */
+	int target_netns;	/* IFLA_NET_NS_FD */
+};
+
+static int populate_newlink_req(struct newlink_req *req, int msg_type, NetDeviceEntry *nde,
+		int (*link_info)(NetDeviceEntry *, struct newlink_req *), struct newlink_extras *extras)
 {
-	struct newlink_req req;
+	memset(req, 0, sizeof(*req));
 
-	memset(&req, 0, sizeof(req));
-
-	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
-	req.h.nlmsg_flags = NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE;
-	req.h.nlmsg_type = msg_type;
-	req.h.nlmsg_seq = CR_NLMSG_SEQ;
-	req.i.ifi_family = AF_PACKET;
+	req->h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	req->h.nlmsg_flags = NLM_F_REQUEST|NLM_F_ACK|NLM_F_CREATE;
+	req->h.nlmsg_type = msg_type;
+	req->h.nlmsg_seq = CR_NLMSG_SEQ;
+	req->i.ifi_family = AF_PACKET;
 	/*
 	 * SETLINK is called for external devices which may
 	 * have ifindex changed. Thus configure them by their
 	 * name only.
 	 */
 	if (msg_type == RTM_NEWLINK)
-		req.i.ifi_index = nde->ifindex;
-	req.i.ifi_flags = nde->flags;
+		req->i.ifi_index = nde->ifindex;
+	req->i.ifi_flags = nde->flags;
 
-	addattr_l(&req.h, sizeof(req), IFLA_IFNAME, nde->name, strlen(nde->name));
-	addattr_l(&req.h, sizeof(req), IFLA_MTU, &nde->mtu, sizeof(nde->mtu));
+	if (extras) {
+		if (extras->link >= 0)
+			addattr_l(&req->h, sizeof(*req), IFLA_LINK, &extras->link, sizeof(extras->link));
+
+		if (extras->target_netns >= 0)
+			addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &extras->target_netns, sizeof(extras->target_netns));
+
+	}
+
+	addattr_l(&req->h, sizeof(*req), IFLA_IFNAME, nde->name, strlen(nde->name));
+	addattr_l(&req->h, sizeof(*req), IFLA_MTU, &nde->mtu, sizeof(nde->mtu));
 
 	if (nde->has_address) {
 		pr_debug("Restore ll addr (%02x:../%d) for device\n",
 				(int)nde->address.data[0], (int)nde->address.len);
-		addattr_l(&req.h, sizeof(req), IFLA_ADDRESS,
+		addattr_l(&req->h, sizeof(*req), IFLA_ADDRESS,
 				nde->address.data, nde->address.len);
 	}
 
@@ -865,29 +943,42 @@ static int do_rtm_link_req(int msg_type, NetDeviceEntry *nde, int nlsk,
 		struct rtattr *linkinfo;
 		int ret;
 
-		linkinfo = NLMSG_TAIL(&req.h);
-		addattr_l(&req.h, sizeof(req), IFLA_LINKINFO, NULL, 0);
+		linkinfo = NLMSG_TAIL(&req->h);
+		addattr_l(&req->h, sizeof(*req), IFLA_LINKINFO, NULL, 0);
 
-		ret = link_info(nde, &req);
+		ret = link_info(nde, req);
 		if (ret < 0)
 			return ret;
 
-		linkinfo->rta_len = (void *)NLMSG_TAIL(&req.h) - (void *)linkinfo;
+		linkinfo->rta_len = (void *)NLMSG_TAIL(&req->h) - (void *)linkinfo;
 	}
+
+	return 0;
+}
+
+static int do_rtm_link_req(int msg_type, NetDeviceEntry *nde, int nlsk,
+		int (*link_info)(NetDeviceEntry *, struct newlink_req *),
+		struct newlink_extras *extras)
+{
+	struct newlink_req req;
+
+	if (populate_newlink_req(&req, msg_type, nde, link_info, extras) < 0)
+		return -1;
 
 	return do_rtnl_req(nlsk, &req, req.h.nlmsg_len, restore_link_cb, NULL, NULL);
 }
 
 int restore_link_parms(NetDeviceEntry *nde, int nlsk)
 {
-	return do_rtm_link_req(RTM_SETLINK, nde, nlsk, NULL);
+	return do_rtm_link_req(RTM_SETLINK, nde, nlsk, NULL, NULL);
 }
 
 static int restore_one_link(NetDeviceEntry *nde, int nlsk,
-		int (*link_info)(NetDeviceEntry *, struct newlink_req *))
+		int (*link_info)(NetDeviceEntry *, struct newlink_req *),
+		struct newlink_extras *extras)
 {
 	pr_info("Restoring netdev %s idx %d\n", nde->name, nde->ifindex);
-	return do_rtm_link_req(RTM_NEWLINK, nde, nlsk, link_info);
+	return do_rtm_link_req(RTM_NEWLINK, nde, nlsk, link_info, extras);
 }
 
 #ifndef VETH_INFO_MAX
@@ -904,12 +995,25 @@ enum {
 #define IFLA_NET_NS_FD	28
 #endif
 
+static void veth_peer_info(NetDeviceEntry *nde, struct newlink_req *req)
+{
+	char key[100], *val;
+
+	snprintf(key, sizeof(key), "veth[%s]", nde->name);
+	val = external_lookup_by_key(key);
+	if (!IS_ERR_OR_NULL(val)) {
+		char *aux;
+
+		aux = strchrnul(val, '@');
+		addattr_l(&req->h, sizeof(*req), IFLA_IFNAME, val, aux - val);
+	}
+}
+
 static int veth_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 {
 	int ns_fd = get_service_fd(NS_FD_OFF);
 	struct rtattr *veth_data, *peer_data;
 	struct ifinfomsg ifm;
-	struct veth_pair *n;
 
 	BUG_ON(ns_fd < 0);
 
@@ -920,12 +1024,7 @@ static int veth_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 	peer_data = NLMSG_TAIL(&req->h);
 	memset(&ifm, 0, sizeof(ifm));
 	addattr_l(&req->h, sizeof(*req), VETH_INFO_PEER, &ifm, sizeof(ifm));
-	list_for_each_entry(n, &opts.veth_pairs, node) {
-		if (!strcmp(nde->name, n->inside))
-			break;
-	}
-	if (&n->node != &opts.veth_pairs)
-		addattr_l(&req->h, sizeof(*req), IFLA_IFNAME, n->outside, strlen(n->outside));
+	veth_peer_info(nde, req);
 	addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &ns_fd, sizeof(ns_fd));
 	peer_data->rta_len = (void *)NLMSG_TAIL(&req->h) - (void *)peer_data;
 	veth_data->rta_len = (void *)NLMSG_TAIL(&req->h) - (void *)veth_data;
@@ -960,7 +1059,127 @@ static int bridge_link_info(NetDeviceEntry *nde, struct newlink_req *req)
 	return 0;
 }
 
-static int restore_link(NetDeviceEntry *nde, int nlsk)
+static int changeflags(int s, char *name, short flags)
+{
+	struct ifreq ifr;
+
+	strlcpy(ifr.ifr_name, name, IFNAMSIZ);
+	ifr.ifr_flags = flags;
+
+	if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
+		pr_perror("couldn't set flags on %s", name);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int macvlan_link_info(NetDeviceEntry *nde, struct newlink_req *req)
+{
+	struct rtattr *macvlan_data;
+	MacvlanLinkEntry *macvlan = nde->macvlan;
+
+	if (!macvlan) {
+		pr_err("Missing macvlan link entry %d\n", nde->ifindex);
+		return -1;
+	}
+
+	addattr_l(&req->h, sizeof(*req), IFLA_INFO_KIND, "macvlan", 7);
+
+	macvlan_data = NLMSG_TAIL(&req->h);
+	addattr_l(&req->h, sizeof(*req), IFLA_INFO_DATA, NULL, 0);
+
+	addattr_l(&req->h, sizeof(*req), IFLA_MACVLAN_MODE, &macvlan->mode, sizeof(macvlan->mode));
+
+	if (macvlan->has_flags)
+		addattr_l(&req->h, sizeof(*req), IFLA_MACVLAN_FLAGS, &macvlan->flags, sizeof(macvlan->flags));
+
+	macvlan_data->rta_len = (void *)NLMSG_TAIL(&req->h) - (void *)macvlan_data;
+
+	return 0;
+}
+
+static int userns_restore_one_link(void *arg, int fd, pid_t pid)
+{
+	int nlsk, ret;
+	struct newlink_req *req = arg;
+	int ns_fd = get_service_fd(NS_FD_OFF), rst = -1;
+
+	if (!(root_ns_mask & CLONE_NEWUSER)) {
+		if (switch_ns_by_fd(ns_fd, &net_ns_desc, &rst))
+			return -1;
+	}
+
+	nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (nlsk < 0) {
+		pr_perror("Can't create nlk socket");
+		ret = -1;
+		goto out;
+	}
+
+	addattr_l(&req->h, sizeof(*req), IFLA_NET_NS_FD, &fd, sizeof(fd));
+
+	ret = do_rtnl_req(nlsk, req, req->h.nlmsg_len, restore_link_cb, NULL, NULL);
+	close(nlsk);
+
+out:
+	if (rst >= 0 && restore_ns(rst, &net_ns_desc) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int restore_one_macvlan(NetDeviceEntry *nde, int nlsk, int criu_nlsk)
+{
+	struct newlink_extras extras = {
+		.link = -1,
+		.target_netns = -1,
+	};
+	char key[100], *val;
+	int my_netns = -1, ret = -1;
+
+	snprintf(key, sizeof(key), "macvlan[%s]", nde->name);
+	val = external_lookup_data(key);
+	if (IS_ERR_OR_NULL(val)) {
+		pr_err("a macvlan parent for %s is required\n", nde->name);
+		return -1;
+	}
+
+	/* link and netns_id are used to identify the master device to plug our
+	 * macvlan slave into. We identify the destination via setting
+	 * IFLA_NET_NS_FD to my_netns, but we have to do that in two different
+	 * ways: in the userns case, we send the fd across to usernsd and set
+	 * it there, whereas in the non-userns case we can just set it here,
+	 * since we can just use a socket from criu's net ns given to us by
+	 * restore_links(). We need to do this two different ways because
+	 * CAP_NET_ADMIN is required in both namespaces, which we don't have in
+	 * the userns case, and usernsd doesn't exist in the non-userns case.
+	 */
+	extras.link = (int) (unsigned long) val;
+
+	my_netns = open_proc(PROC_SELF, "ns/net");
+	if (my_netns < 0)
+		return -1;
+
+	{
+		struct newlink_req req;
+
+		if (populate_newlink_req(&req, RTM_NEWLINK, nde, macvlan_link_info, &extras) < 0)
+			goto out;
+
+		if (userns_call(userns_restore_one_link, 0, &req, sizeof(req), my_netns) < 0) {
+			pr_err("couldn't restore macvlan interface %s via usernsd\n", nde->name);
+			goto out;
+		}
+	}
+
+	ret = 0;
+out:
+	if (my_netns >= 0)
+		close(my_netns);
+	return ret;
+}
+
+static int restore_link(NetDeviceEntry *nde, int nlsk, int criu_nlsk)
 {
 	pr_info("Restoring link %s type %d\n", nde->name, nde->type);
 
@@ -969,14 +1188,15 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 	case ND_TYPE__EXTLINK:  /* see comment in images/netdev.proto */
 		return restore_link_parms(nde, nlsk);
 	case ND_TYPE__VENET:
-		return restore_one_link(nde, nlsk, venet_link_info);
+		return restore_one_link(nde, nlsk, venet_link_info, NULL);
 	case ND_TYPE__VETH:
-		return restore_one_link(nde, nlsk, veth_link_info);
+		return restore_one_link(nde, nlsk, veth_link_info, NULL);
 	case ND_TYPE__TUN:
 		return restore_one_tun(nde, nlsk);
 	case ND_TYPE__BRIDGE:
-		return restore_one_link(nde, nlsk, bridge_link_info);
-
+		return restore_one_link(nde, nlsk, bridge_link_info, NULL);
+	case ND_TYPE__MACVLAN:
+		return restore_one_macvlan(nde, nlsk, criu_nlsk);
 	default:
 		pr_err("Unsupported link type %d\n", nde->type);
 		break;
@@ -987,7 +1207,7 @@ static int restore_link(NetDeviceEntry *nde, int nlsk)
 
 static int restore_links(int pid, NetnsEntry **netns)
 {
-	int nlsk, ret;
+	int nlsk, criu_nlsk = -1, ret = -1;
 	struct cr_img *img;
 	NetDeviceEntry *nde;
 
@@ -1009,7 +1229,7 @@ static int restore_links(int pid, NetnsEntry **netns)
 		if (ret <= 0)
 			break;
 
-		ret = restore_link(nde, nlsk);
+		ret = restore_link(nde, nlsk, criu_nlsk);
 		if (ret) {
 			pr_err("Can't restore link\n");
 			goto exit;
@@ -1043,22 +1263,22 @@ exit:
 	return ret;
 }
 
-static int run_ip_tool(char *arg1, char *arg2, char *arg3, int fdin, int fdout, unsigned flags)
+static int run_ip_tool(char *arg1, char *arg2, char *arg3, char *arg4, int fdin, int fdout, unsigned flags)
 {
 	char *ip_tool_cmd;
 	int ret;
 
-	pr_debug("\tRunning ip %s %s\n", arg1, arg2);
+	pr_debug("\tRunning ip %s %s %s %s\n", arg1, arg2, arg3 ? : "\0", arg4 ? : "\0");
 
 	ip_tool_cmd = getenv("CR_IP_TOOL");
 	if (!ip_tool_cmd)
 		ip_tool_cmd = "ip";
 
 	ret = cr_system(fdin, fdout, -1, ip_tool_cmd,
-				(char *[]) { "ip", arg1, arg2, arg3, NULL }, flags);
+				(char *[]) { "ip", arg1, arg2, arg3, arg4, NULL }, flags);
 	if (ret) {
 		if (!(flags & CRS_CAN_FAIL))
-			pr_err("IP tool failed on %s %s\n", arg1, arg2);
+			pr_err("IP tool failed on %s %s %s %s\n", arg1, arg2, arg3 ? : "\0", arg4 ? : "\0");
 		return -1;
 	}
 
@@ -1084,7 +1304,7 @@ static int run_iptables_tool(char *def_cmd, int fdin, int fdout)
 static inline int dump_ifaddr(struct cr_imgset *fds)
 {
 	struct cr_img *img = img_from_set(fds, CR_FD_IFADDR);
-	return run_ip_tool("addr", "save", NULL, -1, img_raw_fd(img), 0);
+	return run_ip_tool("addr", "save", NULL, NULL, -1, img_raw_fd(img), 0);
 }
 
 static inline int dump_route(struct cr_imgset *fds)
@@ -1092,7 +1312,7 @@ static inline int dump_route(struct cr_imgset *fds)
 	struct cr_img *img;
 
 	img = img_from_set(fds, CR_FD_ROUTE);
-	if (run_ip_tool("route", "save", NULL, -1, img_raw_fd(img), 0))
+	if (run_ip_tool("route", "save", NULL, NULL, -1, img_raw_fd(img), 0))
 		return -1;
 
 	/* If ipv6 is disabled, "ip -6 route dump" dumps all routes */
@@ -1100,7 +1320,7 @@ static inline int dump_route(struct cr_imgset *fds)
 		return 0;
 
 	img = img_from_set(fds, CR_FD_ROUTE6);
-	if (run_ip_tool("-6", "route", "save", -1, img_raw_fd(img), 0))
+	if (run_ip_tool("-6", "route", "save", NULL, -1, img_raw_fd(img), 0))
 		return -1;
 
 	return 0;
@@ -1117,7 +1337,7 @@ static inline int dump_rule(struct cr_imgset *fds)
 	if (!path)
 		return -1;
 
-	if (run_ip_tool("rule", "save", NULL, -1, img_raw_fd(img), CRS_CAN_FAIL)) {
+	if (run_ip_tool("rule", "save", NULL, NULL, -1, img_raw_fd(img), CRS_CAN_FAIL)) {
 		pr_warn("Check if \"ip rule save\" is supported!\n");
 		unlinkat(get_service_fd(IMG_FD_OFF), path, 0);
 	}
@@ -1249,7 +1469,7 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 		return 0;
 	}
 	if (img) {
-		ret = run_ip_tool(cmd, "restore", NULL, img_raw_fd(img), -1, 0);
+		ret = run_ip_tool(cmd, "restore", NULL, NULL, img_raw_fd(img), -1, 0);
 		close_image(img);
 	}
 
@@ -1290,9 +1510,8 @@ static inline int restore_rule(int pid)
 	 * Delete 3 default rules to prevent duplicates. See kernel's
 	 * function fib_default_rules_init() for the details.
 	 */
-	run_ip_tool("rule", "delete", NULL, -1, -1, 0);
-	run_ip_tool("rule", "delete", NULL, -1, -1, 0);
-	run_ip_tool("rule", "delete", NULL, -1, -1, 0);
+	run_ip_tool("rule", "flush",  NULL,    NULL,    -1, -1, 0);
+	run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
 
 	if (restore_ip_dump(CR_FD_RULE, pid, "rule"))
 		ret = -1;
@@ -1436,9 +1655,9 @@ int dump_net_ns(int ns_id)
 			ret = dump_route(fds);
 		if (!ret)
 			ret = dump_rule(fds);
+		if (!ret)
+			ret = dump_iptables(fds);
 	}
-	if (!ret)
-		ret = dump_iptables(fds);
 	if (!ret)
 		ret = dump_nf_ct(fds, CR_FD_NETNF_CT);
 	if (!ret)
@@ -1469,9 +1688,10 @@ int prepare_net_ns(int pid)
 			ret = restore_route(pid);
 		if (!ret)
 			ret = restore_rule(pid);
+		if (!ret)
+			ret = restore_iptables(pid);
 	}
-	if (!ret)
-		ret = restore_iptables(pid);
+
 	if (!ret)
 		ret = restore_nf_ct(pid, CR_FD_NETNF_CT);
 	if (!ret)
@@ -1495,11 +1715,9 @@ int netns_keep_nsfd(void)
 	 * that before we leave the existing namespaces.
 	 */
 
-	ns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
-	if (ns_fd < 0) {
-		pr_perror("Can't cache net fd");
+	ns_fd = __open_proc(PROC_SELF, 0, O_RDONLY | O_CLOEXEC, "ns/net");
+	if (ns_fd < 0)
 		return -1;
-	}
 
 	ret = install_service_fd(NS_FD_OFF, ns_fd);
 	if (ret < 0)
@@ -1543,17 +1761,18 @@ err:
 	return ret;
 }
 
-static int network_lock_internal()
+int network_lock_internal()
 {
 	char conf[] =	"*filter\n"
 				":CRIU - [0:0]\n"
 				"-I INPUT -j CRIU\n"
 				"-I OUTPUT -j CRIU\n"
+				"-A CRIU -m mark --mark " __stringify(SOCCR_MARK) " -j ACCEPT\n"
 				"-A CRIU -j DROP\n"
 				"COMMIT\n";
 	int ret = 0, nsret;
 
-	if (switch_ns(root_item->pid.real, &net_ns_desc, &nsret))
+	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
 
@@ -1577,7 +1796,7 @@ static int network_unlock_internal()
 			"COMMIT\n";
 	int ret = 0, nsret;
 
-	if (switch_ns(root_item->pid.real, &net_ns_desc, &nsret))
+	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
 
@@ -1620,32 +1839,23 @@ void network_unlock(void)
 
 int veth_pair_add(char *in, char *out)
 {
-	char *aux;
-	struct veth_pair *n;
+	char *e_str;
 
-	n = xmalloc(sizeof(*n));
-	if (n == NULL)
+	e_str = xmalloc(200); /* For 3 IFNAMSIZ + 8 service characters */
+	if (!e_str)
 		return -1;
+	snprintf(e_str, 200, "veth[%s]:%s", in, out);
+	return add_external(e_str);
+}
 
-	n->inside = in;
-	n->outside = out;
-	/*
-	 * Does the out string specify a bridge for
-	 * moving the outside end of the veth pair to?
-	 */
-	aux = strrchr(out, '@');
-	if (aux) {
-		*aux++ = '\0';
-		n->bridge = aux;
-	} else {
-		n->bridge = NULL;
+int macvlan_ext_add(struct external *ext)
+{
+	ext->data = (void *) (unsigned long) if_nametoindex(external_val(ext));
+	if (ext->data == 0) {
+		pr_perror("can't get ifindex of %s", ext->id);
+		return -1;
 	}
 
-	list_add(&n->node, &opts.veth_pairs);
-	if (n->bridge)
-		pr_debug("Added %s:%s@%s veth map\n", in, out, aux);
-	else
-		pr_debug("Added %s:%s veth map\n", in, out);
 	return 0;
 }
 
@@ -1727,20 +1937,26 @@ int collect_net_namespaces(bool for_dump)
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");
 
-int move_veth_to_bridge(void)
+static int move_to_bridge(struct external *ext, void *arg)
 {
-	int s;
+	int s = *(int *)arg;
 	int ret;
-	struct veth_pair *n;
+	char *out, *br;
 	struct ifreq ifr;
 
-	s = -1;
-	ret = 0;
-	list_for_each_entry(n, &opts.veth_pairs, node) {
-		if (n->bridge == NULL)
-			continue;
+	out = external_val(ext);
+	if (!out)
+		return -1;
 
-		pr_debug("\tMoving dev %s to bridge %s\n", n->outside, n->bridge);
+	br = strchr(out, '@');
+	if (!br)
+		return 0;
+
+	*br = '\0';
+	br++;
+
+	{
+		pr_debug("\tMoving dev %s to bridge %s\n", out, br);
 
 		if (s == -1) {
 			s = socket(AF_LOCAL, SOCK_STREAM|SOCK_CLOEXEC, 0);
@@ -1754,18 +1970,17 @@ int move_veth_to_bridge(void)
 		 * Add the device to the bridge. This is equivalent to:
 		 * $ brctl addif <bridge> <device>
 		 */
-		ifr.ifr_ifindex = if_nametoindex(n->outside);
+		ifr.ifr_ifindex = if_nametoindex(out);
 		if (ifr.ifr_ifindex == 0) {
-			pr_perror("Can't get index of %s", n->outside);
+			pr_perror("Can't get index of %s", out);
 			ret = -1;
-			break;
+			goto out;
 		}
-		strlcpy(ifr.ifr_name, n->bridge, IFNAMSIZ);
+		strlcpy(ifr.ifr_name, br, IFNAMSIZ);
 		ret = ioctl(s, SIOCBRADDIF, &ifr);
 		if (ret < 0) {
-			pr_perror("Can't add interface %s to bridge %s",
-				n->outside, n->bridge);
-			break;
+			pr_perror("Can't add interface %s to bridge %s", out, br);
+			goto out;
 		}
 
 		/*
@@ -1773,24 +1988,36 @@ int move_veth_to_bridge(void)
 		 * $ ip link set dev <device> up
 		 */
 		ifr.ifr_ifindex = 0;
-		strlcpy(ifr.ifr_name, n->outside, IFNAMSIZ);
+		strlcpy(ifr.ifr_name, out, IFNAMSIZ);
 		ret = ioctl(s, SIOCGIFFLAGS, &ifr);
 		if (ret < 0) {
-			pr_perror("Can't get flags of interface %s", n->outside);
-			break;
+			pr_perror("Can't get flags of interface %s", out);
+			goto out;
 		}
-		if (ifr.ifr_flags & IFF_UP)
-			continue;
-		ifr.ifr_flags |= IFF_UP;
-		ret = ioctl(s, SIOCSIFFLAGS, &ifr);
-		if (ret < 0) {
-			pr_perror("Can't set flags of interface %s to 0x%x",
-				n->outside, ifr.ifr_flags);
-			break;
-		}
-	}
 
-	if (s >= 0)
-		close(s);
+		ret = 0;
+		if (ifr.ifr_flags & IFF_UP)
+			goto out;
+
+		ifr.ifr_flags |= IFF_UP;
+		if (changeflags(s, out, ifr.ifr_flags) < 0)
+			goto out;
+		ret = 0;
+	}
+out:
+	br--;
+	*br = '@';
+	*(int *)arg = s;
+	return ret;
+}
+
+int move_veth_to_bridge(void)
+{
+	int sk = -1, ret;
+
+	ret = external_for_each_type("veth", move_to_bridge, &sk);
+	if (sk >= 0)
+		close(sk);
+
 	return ret;
 }

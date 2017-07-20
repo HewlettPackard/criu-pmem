@@ -13,8 +13,7 @@
 #include <sys/epoll.h>
 
 #include "crtools.h"
-#include "compiler.h"
-#include "asm/types.h"
+#include "common/compiler.h"
 #include "imgset.h"
 #include "rst_info.h"
 #include "eventpoll.h"
@@ -22,6 +21,7 @@
 #include "image.h"
 #include "util.h"
 #include "log.h"
+#include "pstree.h"
 
 #include "protobuf.h"
 #include "images/eventpoll.pb-c.h"
@@ -114,12 +114,18 @@ const struct fdtype_ops eventpoll_dump_ops = {
 	.dump		= dump_one_eventpoll,
 };
 
-static int eventpoll_open(struct file_desc *d)
+static int eventpoll_post_open(struct file_desc *d, int fd);
+
+static int eventpoll_open(struct file_desc *d, int *new_fd)
 {
+	struct fdinfo_list_entry *fle = file_master(d);
 	struct eventpoll_file_info *info;
 	int tmp;
 
 	info = container_of(d, struct eventpoll_file_info, d);
+
+	if (fle->stage >= FLE_OPEN)
+		return eventpoll_post_open(d, fle->fe->fd);
 
 	pr_info_eventpoll("Restore ", info->efe);
 
@@ -136,11 +142,34 @@ static int eventpoll_open(struct file_desc *d)
 		goto err_close;
 	}
 
-	return tmp;
+	*new_fd = tmp;
+	return 1;
 err_close:
 	close(tmp);
 	return -1;
 }
+
+static int epoll_not_ready_tfd(EventpollTfdEntry *tdefe)
+{
+	struct fdinfo_list_entry *fle;
+
+	list_for_each_entry(fle, &rsti(current)->fds, ps_list) {
+		if (tdefe->tfd != fle->fe->fd)
+			continue;
+
+		if (fle->desc->ops->type == FD_TYPES__EVENTPOLL)
+			return (fle->stage < FLE_OPEN);
+		else
+			return (fle->stage != FLE_RESTORED);
+	}
+
+	/*
+	 * If tgt fle is not on the fds list, it's already
+	 * restored (see open_fdinfos), so we're ready.
+	 */
+	return 0;
+}
+
 static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
 {
 	struct epoll_event event;
@@ -166,10 +195,18 @@ static int eventpoll_post_open(struct file_desc *d, int fd)
 	info = container_of(d, struct eventpoll_file_info, d);
 
 	for (i = 0; i < info->efe->n_tfd; i++) {
+		if (epoll_not_ready_tfd(info->efe->tfd[i]))
+			return 1;
+	}
+	for (i = 0; i < info->efe->n_tfd; i++) {
 		if (eventpoll_retore_tfd(fd, info->efe->id, info->efe->tfd[i]))
 			return -1;
 	}
 
+	list_for_each_entry(td_info, &eventpoll_tfds, list) {
+		if (epoll_not_ready_tfd(td_info->tdefe))
+			return 1;
+	}
 	list_for_each_entry(td_info, &eventpoll_tfds, list) {
 		if (td_info->tdefe->id != info->efe->id)
 			continue;
@@ -182,17 +219,9 @@ static int eventpoll_post_open(struct file_desc *d, int fd)
 	return 0;
 }
 
-static void eventpoll_collect_fd(struct file_desc *d,
-		struct fdinfo_list_entry *fle, struct rst_info *ri)
-{
-	list_add_tail(&fle->ps_list, &ri->eventpoll);
-}
-
 static struct file_desc_ops desc_ops = {
 	.type = FD_TYPES__EVENTPOLL,
 	.open = eventpoll_open,
-	.post_open = eventpoll_post_open,
-	.collect_fd = eventpoll_collect_fd,
 };
 
 static int collect_one_epoll_tfd(void *o, ProtobufCMessage *msg, struct cr_img *i)

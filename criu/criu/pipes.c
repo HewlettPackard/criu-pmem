@@ -1,7 +1,6 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -14,8 +13,11 @@
 #include "autofs.h"
 
 #include "protobuf.h"
+#include "util.h"
 #include "images/pipe.pb-c.h"
 #include "images/pipe-data.pb-c.h"
+#include "fcntl.h"
+#include "namespaces.h"
 
 static LIST_HEAD(pipes);
 
@@ -212,10 +214,10 @@ err:
 	return ret;
 }
 
-static int reopen_pipe(int fd, int flags)
+static int userns_reopen(void *_arg, int fd, pid_t pid)
 {
-	int ret;
 	char path[PSFDS];
+	int ret, flags = *(int*)_arg;
 
 	sprintf(path, "/proc/self/fd/%d", fd);
 	ret = open(path, flags);
@@ -226,22 +228,36 @@ static int reopen_pipe(int fd, int flags)
 	return ret;
 }
 
-static int recv_pipe_fd(struct pipe_info *pi)
+static int reopen_pipe(int fd, int flags)
 {
-	struct fdinfo_list_entry *fle;
-	int tmp, fd;
+	int ret;
+	char path[PSFDS];
 
-	fle = file_master(&pi->d);
-	fd = fle->fe->fd;
-
-	pr_info("\tWaiting fd for %d\n", fd);
-
-	tmp = recv_fd(fd);
-	if (tmp < 0) {
-		pr_err("Can't get fd %d\n", tmp);
-		return -1;
+	sprintf(path, "/proc/self/fd/%d", fd);
+	ret = open(path, flags);
+	if (ret < 0) {
+		if (errno == EACCES) {
+			/* It may be an external pipe from an another userns */
+			ret = userns_call(userns_reopen, UNS_FDOUT,
+						&flags, sizeof(flags), fd);
+		} else
+			pr_perror("Unable to reopen the pipe %s", path);
 	}
 	close(fd);
+
+	return ret;
+}
+
+static int recv_pipe_fd(struct pipe_info *pi, int *new_fd)
+{
+	int tmp, fd, ret;
+
+	ret = recv_desc_from_peer(&pi->d, &tmp);
+	if (ret != 0) {
+		if (ret != 1)
+			pr_err("Can't get fd %d\n", tmp);
+		return ret;
+	}
 
 	if (pi->reopen)
 		fd = reopen_pipe(tmp, pi->pe->flags);
@@ -252,9 +268,10 @@ static int recv_pipe_fd(struct pipe_info *pi)
 			close(fd);
 			return -1;
 		}
+		*new_fd = fd;
 	}
 
-	return fd;
+	return fd < 0 ? -1 : 0;
 }
 
 static char *pipe_d_name(struct file_desc *d, char *buf, size_t s)
@@ -271,12 +288,11 @@ static char *pipe_d_name(struct file_desc *d, char *buf, size_t s)
 	return buf;
 }
 
-static int open_pipe(struct file_desc *d)
+int open_pipe(struct file_desc *d, int *new_fd)
 {
 	struct pipe_info *pi, *p;
 	int ret, tmp;
 	int pfd[2];
-	int sock;
 
 	pi = container_of(d, struct pipe_info, d);
 	pr_info("\t\tCreating pipe pipe_id=%#x id=%#x\n", pi->pe->pipe_id, pi->pe->id);
@@ -285,11 +301,11 @@ static int open_pipe(struct file_desc *d)
 			return tmp;
 
 		pi->reopen = 1;
-		goto out;
+		goto reopen;
 	}
 
 	if (!pi->create)
-		return recv_pipe_fd(pi);
+		return recv_pipe_fd(pi, new_fd);
 
 	if (pipe(pfd) < 0) {
 		pr_perror("Can't create pipe");
@@ -301,16 +317,10 @@ static int open_pipe(struct file_desc *d)
 	if (ret)
 		return -1;
 
-	sock = get_service_fd(TRANSPORT_FD_OFF);
-
 	list_for_each_entry(p, &pi->pipe_list, pipe_list) {
-		struct fdinfo_list_entry *fle;
-		int fd;
+		int fd = pfd[p->pe->flags & O_WRONLY];
 
-		fle = file_master(&p->d);
-		fd = pfd[p->pe->flags & O_WRONLY];
-
-		if (send_fd_to_peer(fd, fle, sock)) {
+		if (send_desc_to_peer(fd, &p->d)) {
 			pr_perror("Can't send file descriptor");
 			return -1;
 		}
@@ -319,29 +329,22 @@ static int open_pipe(struct file_desc *d)
 	close(pfd[!(pi->pe->flags & O_WRONLY)]);
 	tmp = pfd[pi->pe->flags & O_WRONLY];
 
-out:
+reopen:
 	if (pi->reopen)
 		tmp = reopen_pipe(tmp, pi->pe->flags);
 
 	if (tmp >= 0)
 		if (rst_file_params(tmp, pi->pe->fown, pi->pe->flags))
 			return -1;
-
-	return tmp;
-}
-
-static int want_transport(FdinfoEntry *fe, struct file_desc *d)
-{
-	struct pipe_info *pi;
-
-	pi = container_of(d, struct pipe_info, d);
-	return !pi->create;
+	if (tmp < 0)
+		return -1;
+	*new_fd = tmp;
+	return 0;
 }
 
 static struct file_desc_ops pipe_desc_ops = {
 	.type		= FD_TYPES__PIPE,
 	.open		= open_pipe,
-	.want_transport	= want_transport,
 	.name		= pipe_d_name,
 };
 
@@ -369,9 +372,8 @@ int collect_one_pipe_ops(void *o, ProtobufCMessage *base, struct file_desc_ops *
 			list_add(&pi->pipe_list, &tmp->pipe_list);
 	}
 
-	if (list_empty(&pipes))
-		if (add_post_prepare_cb(mark_pipe_master, NULL))
-			return -1;
+	if (add_post_prepare_cb_once(mark_pipe_master, NULL))
+		return -1;
 
 	list_add_tail(&pi->list, &pipes);
 

@@ -321,6 +321,17 @@ void criu_set_tcp_skip_in_flight(bool tcp_skip_in_flight)
 	criu_local_set_tcp_skip_in_flight(global_opts, tcp_skip_in_flight);
 }
 
+void criu_local_set_weak_sysctls(criu_opts *opts, bool val)
+{
+	opts->rpc->has_weak_sysctls = true;
+	opts->rpc->weak_sysctls	= val;
+}
+
+void criu_set_weak_sysctls(bool val)
+{
+	criu_local_set_weak_sysctls(global_opts, val);
+}
+
 void criu_local_set_evasive_devices(criu_opts *opts, bool evasive_devices)
 {
 	opts->rpc->has_evasive_devices	= true;
@@ -797,6 +808,76 @@ void criu_set_ghost_limit(unsigned int limit)
 int criu_add_irmap_path(char *path)
 {
 	return criu_local_add_irmap_path(global_opts, path);
+}
+
+int criu_local_add_inherit_fd(criu_opts *opts, int fd, char *key)
+{
+	int nr;
+	InheritFd **a, *f;
+
+	/* Inheriting is only supported with swrk mode */
+	if (opts->service_comm != CRIU_COMM_BIN)
+		return -1;
+
+	f = malloc(sizeof(*f));
+	if (!f)
+		goto er;
+	inherit_fd__init(f);
+
+	f->fd = fd;
+	f->key = strdup(key);
+	if (!f->key)
+		goto er_f;
+
+	nr = opts->rpc->n_inherit_fd + 1;
+	a = realloc(opts->rpc->inherit_fd, nr * sizeof(f));
+	if (!a)
+		goto err_k;
+
+	a[nr - 1] = f;
+	opts->rpc->inherit_fd = a;
+	opts->rpc->n_inherit_fd = nr;
+	return 0;
+err_k:
+	free(f->key);
+er_f:
+	free(f);
+er:
+	return -ENOMEM;
+}
+
+int criu_add_inherit_fd(int fd, char *key)
+{
+	return criu_local_add_inherit_fd(global_opts, fd, key);
+}
+
+int criu_local_add_external(criu_opts *opts, char *key)
+{
+	int nr;
+	char **a, *e = NULL;
+
+	e = strdup(key);
+	if (!e)
+		goto err;
+
+	nr = opts->rpc->n_external + 1;
+	a = realloc(opts->rpc->external, nr * sizeof(*a));
+	if (!a)
+		goto err;
+
+	a[nr - 1] = e;
+	opts->rpc->external = a;
+	opts->rpc->n_external = nr;
+	return 0;
+err:
+	if (e)
+		free(e);
+	return -ENOMEM;
+}
+
+int criu_add_external(char *key)
+{
+	return criu_local_add_external(global_opts, key);
 }
 
 static CriuResp *recv_resp(int socket_fd)

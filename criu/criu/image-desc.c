@@ -60,7 +60,7 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY(CREDS,		"creds-%d"),
 	FD_ENTRY(UTSNS,		"utsns-%d"),
 	FD_ENTRY(IPC_VAR,	"ipcns-var-%d"),
-	FD_ENTRY(IPCNS_SHM,	"ipcns-shm-%d"),
+	FD_ENTRY_F(IPCNS_SHM,	"ipcns-shm-%d", O_NOBUF), /* writes segments of data */
 	FD_ENTRY(IPCNS_MSG,	"ipcns-msg-%d"),
 	FD_ENTRY(IPCNS_SEM,	"ipcns-sem-%d"),
 	FD_ENTRY(FS,		"fs-%d"),
@@ -79,7 +79,8 @@ struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX] = {
 	FD_ENTRY_F(TMPFS_IMG,	"tmpfs-%d.tar.gz", O_NOBUF),
 	FD_ENTRY_F(TMPFS_DEV,	"tmpfs-dev-%d.tar.gz", O_NOBUF),
 	FD_ENTRY_F(AUTOFS,	"autofs-%d", O_NOBUF),
-	FD_ENTRY(BINFMT_MISC,	"binfmt-misc-%d"),
+	FD_ENTRY(BINFMT_MISC_OLD, "binfmt-misc-%d"),
+	FD_ENTRY(BINFMT_MISC,	"binfmt-misc"),
 	FD_ENTRY(TTY_FILES,	"tty"),
 	FD_ENTRY(TTY_INFO,	"tty-info"),
 	FD_ENTRY_F(TTY_DATA,	"tty-data", O_NOBUF),

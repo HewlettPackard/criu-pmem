@@ -19,23 +19,25 @@
 
 #include <dlfcn.h>
 
-#include "asm/types.h"
-
-#include "compiler.h"
+#include "int.h"
+#include "page.h"
+#include "common/compiler.h"
 #include "crtools.h"
 #include "cr_options.h"
-#include "sockets.h"
+#include "external.h"
 #include "files.h"
 #include "sk-inet.h"
 #include "net.h"
-#include "netfilter.h"
 #include "version.h"
 #include "page-xfer.h"
 #include "tty.h"
 #include "file-lock.h"
 #include "cr-service.h"
 #include "plugin.h"
+#include "criu-log.h"
+#include "util.h"
 #include "mount.h"
+#include "filesystems.h"
 #include "namespaces.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
@@ -49,6 +51,8 @@
 #include "setproctitle.h"
 #include "sysctl.h"
 
+#include "../soccr/soccr.h"
+
 struct cr_options opts;
 
 void init_opts(void)
@@ -57,8 +61,6 @@ void init_opts(void)
 
 	/* Default options */
 	opts.final_state = TASK_DEAD;
-	INIT_LIST_HEAD(&opts.ext_unixsk_ids);
-	INIT_LIST_HEAD(&opts.veth_pairs);
 	INIT_LIST_HEAD(&opts.ext_mounts);
 	INIT_LIST_HEAD(&opts.inherit_fds);
 	INIT_LIST_HEAD(&opts.external);
@@ -72,6 +74,7 @@ void init_opts(void)
 	opts.ghost_limit = DEFAULT_GHOST_LIMIT;
 	opts.timeout = DEFAULT_TIMEOUT;
 	opts.empty_ns = 0;
+	opts.status_fd = -1;
 }
 
 static int parse_join_ns(const char *ptr)
@@ -193,19 +196,6 @@ static size_t parse_size(char *optarg)
 	return (size_t)atol(optarg);
 }
 
-int add_external(char *key)
-{
-	struct external *ext;
-
-	ext = xmalloc(sizeof(*ext));
-	if (!ext)
-		return -1;
-	ext->id = key;
-	list_add(&ext->node, &opts.external);
-
-	return 0;
-}
-
 bool deprecated_ok(char *what)
 {
 	if (opts.deprecated_ok)
@@ -219,12 +209,18 @@ bool deprecated_ok(char *what)
 
 int main(int argc, char *argv[], char *envp[])
 {
+
+#define BOOL_OPT(OPT_NAME, SAVE_TO) \
+		{OPT_NAME, no_argument, SAVE_TO, true},\
+		{"no-" OPT_NAME, no_argument, SAVE_TO, false}
+
 	pid_t pid = 0, tree_id = 0;
 	int ret = -1;
 	bool usage_error = true;
 	bool has_exec_cmd = false;
+	bool has_sub_command;
 	int opt, idx;
-	int log_level = LOG_UNSET;
+	int log_level = DEFAULT_LOGLEVEL;
 	char *imgs_dir = ".";
 	static const char short_opts[] = "dSsRf:F:t:p:hcD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
@@ -232,9 +228,9 @@ int main(int argc, char *argv[], char *envp[])
 		{ "pid",			required_argument,	0, 'p'	},
 		{ "leave-stopped",		no_argument,		0, 's'	},
 		{ "leave-running",		no_argument,		0, 'R'	},
-		{ "restore-detached",		no_argument,		0, 'd'	},
-		{ "restore-sibling",		no_argument,		0, 'S'	},
-		{ "daemon",			no_argument,		0, 'd'	},
+		BOOL_OPT("restore-detached", &opts.restore_detach),
+		BOOL_OPT("restore-sibling", &opts.restore_sibling),
+		BOOL_OPT("daemon", &opts.restore_detach),
 		{ "contents",			no_argument,		0, 'c'	},
 		{ "file",			required_argument,	0, 'f'	},
 		{ "fields",			required_argument,	0, 'F'	},
@@ -245,27 +241,28 @@ int main(int argc, char *argv[], char *envp[])
 		{ "root",			required_argument,	0, 'r'	},
 		{ USK_EXT_PARAM,		optional_argument,	0, 'x'	},
 		{ "help",			no_argument,		0, 'h'	},
-		{ SK_EST_PARAM,			no_argument,		0, 1042	},
+		BOOL_OPT(SK_EST_PARAM, &opts.tcp_established_ok),
 		{ "close",			required_argument,	0, 1043	},
-		{ "log-pid",			no_argument,		0, 1044	},
+		BOOL_OPT("log-pid", &opts.log_file_per_pid),
 		{ "version",			no_argument,		0, 'V'	},
-		{ "evasive-devices",		no_argument,		0, 1045	},
+		BOOL_OPT("evasive-devices", &opts.evasive_devices),
 		{ "pidfile",			required_argument,	0, 1046	},
 		{ "veth-pair",			required_argument,	0, 1047	},
 		{ "action-script",		required_argument,	0, 1049	},
-		{ LREMAP_PARAM,			no_argument,		0, 1041	},
-		{ OPT_SHELL_JOB,		no_argument,		0, 'j'	},
-		{ OPT_FILE_LOCKS,		no_argument,		0, 'l'	},
-		{ "page-server",		no_argument,		0, 1050	},
+		BOOL_OPT(LREMAP_PARAM, &opts.link_remap_ok),
+		BOOL_OPT(OPT_SHELL_JOB, &opts.shell_job),
+		BOOL_OPT(OPT_FILE_LOCKS, &opts.handle_file_locks),
+		BOOL_OPT("page-server", &opts.use_page_server),
 		{ "address",			required_argument,	0, 1051	},
 		{ "port",			required_argument,	0, 1052	},
 		{ "prev-images-dir",		required_argument,	0, 1053	},
 		{ "ms",				no_argument,		0, 1054	},
-		{ "track-mem",			no_argument,		0, 1055	},
-		{ "auto-dedup",			no_argument,		0, 1056	},
+		BOOL_OPT("track-mem", &opts.track_mem),
+		BOOL_OPT("use-pmem", &opts.use_pmem),
+		BOOL_OPT("auto-dedup", &opts.auto_dedup),
 		{ "libdir",			required_argument,	0, 'L'	},
 		{ "cpu-cap",			optional_argument,	0, 1057	},
-		{ "force-irmap",		no_argument,		0, 1058	},
+		BOOL_OPT("force-irmap", &opts.force_irmap),
 		{ "ext-mount-map",		required_argument,	0, 'M'	},
 		{ "exec-cmd",			no_argument,		0, 1059	},
 		{ "manage-cgroups",		optional_argument,	0, 1060	},
@@ -274,8 +271,8 @@ int main(int argc, char *argv[], char *envp[])
 		{ "feature",			required_argument,	0, 1063	},
 		{ "skip-mnt",			required_argument,	0, 1064 },
 		{ "enable-fs",			required_argument,	0, 1065 },
-		{ "enable-external-sharing", 	no_argument, 		0, 1066 },
-		{ "enable-external-masters", 	no_argument, 		0, 1067 },
+		{ "enable-external-sharing", 	no_argument, 		&opts.enable_external_sharing, true	},
+		{ "enable-external-masters", 	no_argument, 		&opts.enable_external_masters, true	},
 		{ "freeze-cgroup",		required_argument,	0, 1068 },
 		{ "ghost-limit",		required_argument,	0, 1069 },
 		{ "irmap-scan-path",		required_argument,	0, 1070 },
@@ -283,16 +280,21 @@ int main(int argc, char *argv[], char *envp[])
 		{ "timeout",			required_argument,	0, 1072 },
 		{ "external",			required_argument,	0, 1073	},
 		{ "empty-ns",			required_argument,	0, 1074	},
-		{ "extra",			no_argument,		0, 1077	},
-		{ "experimental",		no_argument,		0, 1078	},
+		BOOL_OPT("extra", &opts.check_extra_features),
+		BOOL_OPT("experimental", &opts.check_experimental_features),
 		{ "all",			no_argument,		0, 1079	},
 		{ "cgroup-props",		required_argument,	0, 1080	},
 		{ "cgroup-props-file",		required_argument,	0, 1081	},
 		{ "cgroup-dump-controller",	required_argument,	0, 1082	},
-		{ SK_INFLIGHT_PARAM,		no_argument,		0, 1083	},
-		{ "deprecated",			no_argument,		0, 1084 },
+		BOOL_OPT(SK_INFLIGHT_PARAM, &opts.tcp_skip_in_flight),
+		BOOL_OPT("deprecated", &opts.deprecated_ok),
+		BOOL_OPT("display-stats", &opts.display_stats),
+		BOOL_OPT("weak-sysctls", &opts.weak_sysctls),
+		{ "status-fd",			required_argument,	0, 1088 },
 		{ },
 	};
+
+#undef BOOL_OPT
 
 	BUILD_BUG_ON(PAGE_SIZE != PAGE_IMAGE_SIZE);
 	BUILD_BUG_ON(CTL_32 != SYSCTL_TYPE__CTL_32);
@@ -318,7 +320,7 @@ int main(int argc, char *argv[], char *envp[])
 		/*
 		 * This is to start criu service worker from libcriu calls.
 		 * The usage is "criu swrk <fd>" and is not for CLI/scripts.
-		 * The arguments semantics can change at any tyme with the
+		 * The arguments semantics can change at any time with the
 		 * corresponding lib call change.
 		 */
 		opts.swrk_restore = true;
@@ -330,6 +332,8 @@ int main(int argc, char *argv[], char *envp[])
 		opt = getopt_long(argc, argv, short_opts, long_opts, &idx);
 		if (opt == -1)
 			break;
+		if (!opt)
+			continue;
 
 		switch (opt) {
 		case 's':
@@ -385,8 +389,6 @@ int main(int argc, char *argv[], char *envp[])
 				goto bad_arg;
 			break;
 		case 'v':
-			if (log_level == LOG_UNSET)
-				log_level = 0;
 			if (optarg) {
 				if (optarg[0] == 'v')
 					/* handle -vvvvv */
@@ -396,14 +398,6 @@ int main(int argc, char *argv[], char *envp[])
 			} else
 				log_level++;
 			break;
-		case 1041:
-			pr_info("Will allow link remaps on FS\n");
-			opts.link_remap_ok = true;
-			break;
-		case 1042:
-			pr_info("Will dump TCP connections\n");
-			opts.tcp_established_ok = true;
-			break;
 		case 1043: {
 			int fd;
 
@@ -412,12 +406,6 @@ int main(int argc, char *argv[], char *envp[])
 			close(fd);
 			break;
 		}
-		case 1044:
-			opts.log_file_per_pid = 1;
-			break;
-		case 1045:
-			opts.evasive_devices = true;
-			break;
 		case 1046:
 			opts.pidfile = optarg;
 			break;
@@ -439,9 +427,6 @@ int main(int argc, char *argv[], char *envp[])
 				return 1;
 
 			break;
-		case 1050:
-			opts.use_page_server = true;
-			break;
 		case 1051:
 			opts.addr = optarg;
 			break;
@@ -458,12 +443,6 @@ int main(int argc, char *argv[], char *envp[])
 			break;
 		case 1053:
 			opts.img_parent = optarg;
-			break;
-		case 1055:
-			opts.track_mem = true;
-			break;
-		case 1056:
-			opts.auto_dedup = true;
 			break;
 		case 1057:
 			if (parse_cpu_cap(&opts, optarg))
@@ -522,12 +501,6 @@ int main(int argc, char *argv[], char *envp[])
 			if (!add_fsname_auto(optarg))
 				return 1;
 			break;
-		case 1066:
-			opts.enable_external_sharing = true;
-			break;
-		case 1067:
-			opts.enable_external_masters = true;
-			break;
 		case 1068:
 			opts.freeze_cgroup = optarg;
 			break;
@@ -571,15 +544,10 @@ int main(int argc, char *argv[], char *envp[])
 			if (!strcmp("net", optarg))
 				opts.empty_ns |= CLONE_NEWNET;
 			else {
-				pr_err("Unsupported empty namespace: %s", optarg);
+				pr_err("Unsupported empty namespace: %s\n",
+						optarg);
 				return 1;
 			}
-			break;
-		case 1077:
-			opts.check_extra_features = true;
-			break;
-		case 1078:
-			opts.check_experimental_features = true;
 			break;
 		case 1079:
 			opts.check_extra_features = true;
@@ -595,13 +563,11 @@ int main(int argc, char *argv[], char *envp[])
 			if (!cgp_add_dump_controller(optarg))
 				return 1;
 			break;
-		case 1083:
-			pr_msg("Will skip in-flight TCP connections\n");
-			opts.tcp_skip_in_flight = true;
-			break;
-		case 1084:
-			pr_msg("Turn deprecated stuff ON\n");
-			opts.deprecated_ok = true;
+		case 1088:
+			if (sscanf(optarg, "%d", &opts.status_fd) != 1) {
+				pr_err("Unable to parse a value of --status-fd\n");
+				return 1;
+			}
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
@@ -616,23 +582,29 @@ int main(int argc, char *argv[], char *envp[])
 		}
 	}
 
+	if (opts.deprecated_ok)
+		pr_msg("Turn deprecated stuff ON\n");
+	if (opts.tcp_skip_in_flight)
+		pr_msg("Will skip in-flight TCP connections\n");
+	if (opts.tcp_established_ok)
+		pr_info("Will dump TCP connections\n");
+	if (opts.link_remap_ok)
+		pr_info("Will allow link remaps on FS\n");
+	if (opts.weak_sysctls)
+		pr_msg("Will skip non-existant sysctls on restore\n");
+
 	if (getenv("CRIU_DEPRECATED")) {
 		pr_msg("Turn deprecated stuff ON via env\n");
 		opts.deprecated_ok = true;
 	}
 
 	if (check_namespace_opts()) {
-		pr_msg("Error: namespace flags confict\n");
+		pr_msg("Error: namespace flags conflict\n");
 		return 1;
 	}
 
 	if (!opts.restore_detach && opts.restore_sibling) {
 		pr_msg("--restore-sibling only makes sense with --restore-detach\n");
-		return 1;
-	}
-
-	if (!opts.autodetect_ext_mounts && (opts.enable_external_masters || opts.enable_external_sharing)) {
-		pr_msg("must specify --ext-mount-map auto with --enable-external-{sharing|masters}");
 		return 1;
 	}
 
@@ -644,8 +616,15 @@ int main(int argc, char *argv[], char *envp[])
 		goto usage;
 	}
 
+	if (!strcmp(argv[optind], "exec")) {
+		pr_msg("The \"exec\" action is deprecated by the Compel library.\n");
+		return -1;
+	}
+
+	has_sub_command = (argc - optind) > 1;
+
 	if (has_exec_cmd) {
-		if (argc - optind <= 1) {
+		if (!has_sub_command) {
 			pr_msg("Error: --exec-cmd requires a command\n");
 			goto usage;
 		}
@@ -665,6 +644,13 @@ int main(int argc, char *argv[], char *envp[])
 			return 1;
 		memcpy(opts.exec_cmd, &argv[optind + 1], (argc - optind - 1) * sizeof(char *));
 		opts.exec_cmd[argc - optind - 1] = NULL;
+	} else {
+		/* No subcommands except for cpuinfo and restore --exec-cmd */
+		if (strcmp(argv[optind], "cpuinfo") && has_sub_command) {
+			pr_msg("Error: excessive parameter%s for command %s\n",
+				(argc - optind) > 2 ? "s" : "", argv[optind]);
+			goto usage;
+		}
 	}
 
 	/* We must not open imgs dir, if service is called */
@@ -693,6 +679,8 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (log_init(opts.output))
 		return 1;
+	libsoccr_set_log(log_level, print_on_level);
+	compel_log_init(vprint_on_level, log_get_loglevel());
 
 	pr_debug("Version: %s (gitid %s)\n", CRIU_VERSION, CRIU_GITID);
 	if (opts.deprecated_ok)
@@ -711,9 +699,6 @@ int main(int argc, char *argv[], char *envp[])
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
 
 	if (!strcmp(argv[optind], "dump")) {
-		preload_socket_modules();
-		preload_netfilter_modules();
-
 		if (!tree_id)
 			goto opt_pid_missing;
 		return cr_dump_tasks(tree_id);
@@ -727,7 +712,6 @@ int main(int argc, char *argv[], char *envp[])
 	}
 
 	if (!strcmp(argv[optind], "restore")) {
-		preload_netfilter_modules();
 		if (tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
 
@@ -751,16 +735,8 @@ int main(int argc, char *argv[], char *envp[])
 	if (!strcmp(argv[optind], "check"))
 		return cr_check() != 0;
 
-	if (!strcmp(argv[optind], "exec")) {
-		if (!pid)
-			pid = tree_id; /* old usage */
-		if (!pid)
-			goto opt_pid_missing;
-		return cr_exec(pid, argv + optind + 1) != 0;
-	}
-
 	if (!strcmp(argv[optind], "page-server"))
-		return cr_page_server(opts.daemon_mode, -1) > 0 ? 0 : 1;
+		return cr_page_server(opts.daemon_mode, -1) != 0;
 
 	if (!strcmp(argv[optind], "service"))
 		return cr_service(opts.daemon_mode);
@@ -769,8 +745,10 @@ int main(int argc, char *argv[], char *envp[])
 		return cr_dedup() != 0;
 
 	if (!strcmp(argv[optind], "cpuinfo")) {
-		if (!argv[optind + 1])
+		if (!argv[optind + 1]) {
+			pr_msg("Error: cpuinfo requires an action: dump or check\n");
 			goto usage;
+		}
 		if (!strcmp(argv[optind + 1], "dump"))
 			return cpuinfo_dump();
 		else if (!strcmp(argv[optind + 1], "check"))
@@ -784,7 +762,6 @@ usage:
 "  criu dump|pre-dump -t PID [<options>]\n"
 "  criu restore [<options>]\n"
 "  criu check [--feature FEAT]\n"
-"  criu exec -p PID <syscall-string>\n"
 "  criu page-server\n"
 "  criu service [<options>]\n"
 "  criu dedup\n"
@@ -794,7 +771,6 @@ usage:
 "  pre-dump       pre-dump task(s) minimizing their frozen time\n"
 "  restore        restore a process/tree\n"
 "  check          checks whether the kernel support is up-to-date\n"
-"  exec           execute a system call by other task\n"
 "  page-server    launch page server\n"
 "  service        launch service\n"
 "  dedup          remove duplicates in memory dump\n"
@@ -808,6 +784,11 @@ usage:
 	}
 
 	pr_msg("\n"
+
+"Most of the true / false long options (the ones without arguments) can be\n"
+"prefixed with --no- to negate the option (example: --display-stats and\n"
+"--no-display-stats).\n"
+"\n"
 "Dump/Restore options:\n"
 "\n"
 "* Generic:\n"
@@ -826,19 +807,29 @@ usage:
 "     --exec-cmd         execute the command specified after '--' on successful\n"
 "                        restore making it the parent of the restored process\n"
 "  --freeze-cgroup       use cgroup freezer to collect processes\n"
+"  --weak-sysctls        skip restoring sysctls that are not available\n"
+"\n"
+"* External resources support:\n"
+"  --external RES        dump objects from this list as external resources:\n"
+"                        Formats of RES on dump:\n"
+"                            tty[rdev:dev]\n"
+"                            file[mnt_id:inode]\n"
+"                            dev[major/minor]:NAME\n"
+"                            unix[ino]\n"
+"                            mnt[MOUNTPOINT]:COOKIE\n"
+"                            mnt[]{:AUTO_OPTIONS}\n"
+"                        Formats of RES on restore:\n"
+"                            dev[NAME]:DEVPATH\n"
+"                            veth[IFNAME]:OUTNAME{@BRIDGE}\n"
+"                            macvlan[IFNAME]:OUTNAME\n"
+"                            mnt[COOKIE]:ROOT\n"
 "\n"
 "* Special resources support:\n"
-"  -x|--" USK_EXT_PARAM " [inode,...]\n"
-"                        allow external unix connections (optional arguments\n"
-"                        are socketpair inode(s) that allow one-sided dump)\n"
 "     --" SK_EST_PARAM "  checkpoint/restore established TCP connections\n"
 "     --" SK_INFLIGHT_PARAM "   skip (ignore) in-flight TCP connections\n"
 "  -r|--root PATH        change the root filesystem (when run in mount namespace)\n"
 "  --evasive-devices     use any path to a device file if the original one\n"
 "                        is inaccessible\n"
-"  --veth-pair IN=OUT    map inside veth device name to outside one\n"
-"                        can optionally append @<bridge-name> to OUT for moving\n"
-"                        the outside veth to the named bridge\n"
 "  --link-remap          allow one to link unlinked files back when possible\n"
 "  --ghost-limit size    limit max size of deleted file contents inside image\n"
 "  --action-script FILE  add an external action script\n"
@@ -848,19 +839,14 @@ usage:
 "  --force-irmap         force resolving names for inotify/fsnotify watches\n"
 "  --irmap-scan-path FILE\n"
 "                        add a path the irmap hints to scan\n"
-"  -M|--ext-mount-map KEY:VALUE\n"
-"                        add external mount mapping\n"
-"  -M|--ext-mount-map auto\n"
-"                        attempt to autodetect external mount mapings\n"
-"  --enable-external-sharing\n"
-"                        allow autoresolving mounts with external sharing\n"
-"  --enable-external-masters\n"
-"                        allow autoresolving mounts with external masters\n"
 "  --manage-cgroups [m]  dump/restore process' cgroups; argument can be one of\n"
 "                        'none', 'props', 'soft' (default), 'full' or 'strict'\n"
 "  --cgroup-root [controller:]/newroot\n"
-"                        change the root cgroup the controller will be\n"
-"                        installed into. No controller means that root is the\n"
+"                        on dump: change the root for the controller that will\n"
+"                        be dumped. By default, only the paths with tasks in\n"
+"                        them and below will be dumped.\n"
+"                        on restore: change the root cgroup the controller will\n"
+"                        be installed into. No controller means that root is the\n"
 "                        default for all controllers not specified\n"
 "  --cgroup-props STRING\n"
 "                        define cgroup controllers and properties\n"
@@ -876,13 +862,6 @@ usage:
 "  --enable-fs FSNAMES   a comma separated list of filesystem names or \"all\"\n"
 "                        force criu to (try to) dump/restore these filesystem's\n"
 "                        mountpoints even if fs is not supported\n"
-"  --external RES        dump objects from this list as external resources:\n"
-"                        Formats of RES on dump:\n"
-"                            tty[rdev:dev]\n"
-"                            file[mnt_id:inode]\n"
-"                            dev[maj:min]:VAL\n"
-"                        Formats of RES on restore:\n"
-"                            dev[VAL]:DEVPATH\n"
 "  --inherit-fd fd[NUM]:RES\n"
 "                        Inherit file descriptors, treating fd NUM as being\n"
 "                        already opened via an existing RES, which can be:\n"
@@ -890,7 +869,8 @@ usage:
 "                            pipe[inode]\n"
 "                            socket[inode]\n"
 "                            file[mnt_id:inode]\n"
-"  --empty-ns net        Create a namespace, but don't restore its properies\n"
+"                            path/to/file\n"
+"  --empty-ns net        Create a namespace, but don't restore its properties\n"
 "                        (assuming it will be restored by action scripts)\n"
 "  -J|--join-ns NS:{PID|NS_FILE}[,OPTIONS]\n"
 "			Join existing namespace and restore process in it.\n"
@@ -912,11 +892,13 @@ usage:
 "* Logging:\n"
 "  -o|--log-file FILE    log file name\n"
 "     --log-pid          enable per-process logging to separate FILE.pid files\n"
-"  -v[NUM]               set logging level (higher level means more output):\n"
-"                          -v1|-v    - only errors and messages\n"
-"                          -v2|-vv   - also warnings (default level)\n"
-"                          -v3|-vvv  - also information messages and timestamps\n"
-"                          -v4|-vvvv - lots of debug\n"
+"  -v[v...]            increase verbosity (can use multiple v)\n"
+"  -vNUM               set verbosity to NUM (higher level means more output):\n"
+"                          -v1 - only errors and messages\n"
+"                          -v2 - also warnings (default level)\n"
+"                          -v3 - also information messages and timestamps\n"
+"                          -v4 - lots of debug\n"
+"  --display-stats       print out dump/restore stats\n"
 "\n"
 "* Memory dumping options:\n"
 "  --track-mem           turn on memory changes tracker in kernel\n"
@@ -931,6 +913,8 @@ usage:
 "  --address ADDR        address of server or service\n"
 "  --port PORT           port of page server\n"
 "  -d|--daemon           run in the background after creating socket\n"
+"  --status-fd FD        write \\0 to the FD and close it once process is ready\n"
+"                        to handle requests\n"
 "\n"
 "Other options:\n"
 "  -h|--help             show this text\n"

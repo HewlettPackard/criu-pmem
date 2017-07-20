@@ -134,7 +134,7 @@ int main(int argc, char ** argv)
 		}
 
 		if (WTERMSIG(status) != SIGSYS) {
-			pr_perror("expected SIGSYS, got %d\n", WTERMSIG(status));
+			pr_err("expected SIGSYS, got %d\n", WTERMSIG(status));
 			_exit(1);
 		}
 
@@ -184,6 +184,7 @@ err:
 
 #else /* __NR_seccomp */
 
+#define TEST_SKIP_REASON "incompatible kernel (no seccomp)"
 #include "skip-me.c"
 
 #endif /* __NR_seccomp */

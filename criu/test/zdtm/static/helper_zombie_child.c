@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -16,6 +15,7 @@ const char *test_author	= "Tycho Andersen <tycho.andersen@canonical.com>";
 
 void setsid_and_fork(int sk)
 {
+	siginfo_t infop;
 	pid_t zombie;
 
 	setsid();
@@ -29,7 +29,7 @@ void setsid_and_fork(int sk)
 	if (zombie == 0)
 		exit(0);
 
-	if (waitid(P_PID, zombie, NULL, WNOWAIT | WEXITED) < 0) {
+	if (waitid(P_PID, zombie, &infop, WNOWAIT | WEXITED) < 0) {
 		fail("waitid");
 		exit(1);
 	}

@@ -2,8 +2,8 @@
 #define __CR_OPTIONS_H__
 
 #include <stdbool.h>
-
-#include "list.h"
+#include "config.h"
+#include "common/list.h"
 
 /*
  * CPU capability options.
@@ -47,51 +47,44 @@ struct irmap_path_opt {
 	struct irmap *ir;
 };
 
-struct external {
-	struct list_head node;
-	char *id;
-};
-
 struct cr_options {
 	int			final_state;
 	char			*show_dump_file;
 	char			*show_fmt;
-	bool			check_extra_features;
-	bool			check_experimental_features;
+	int			check_extra_features;
+	int			check_experimental_features;
 	bool			show_pages_content;
 	union {
-		bool		restore_detach;
+		int		restore_detach;
 		bool		daemon_mode;
 	};
-	bool			restore_sibling;
+	int			restore_sibling;
 	bool			ext_unix_sk;
-	struct list_head        ext_unixsk_ids;
-	bool			shell_job;
-	bool			handle_file_locks;
-	bool			tcp_established_ok;
-	bool			evasive_devices;
-	bool			link_remap_ok;
-	bool			log_file_per_pid;
+	int			shell_job;
+	int			handle_file_locks;
+	int			tcp_established_ok;
+	int			evasive_devices;
+	int			link_remap_ok;
+	int			log_file_per_pid;
 	bool			swrk_restore;
 	char			*output;
 	char			*root;
 	char			*pidfile;
 	char			*freeze_cgroup;
-	struct list_head	veth_pairs;
 	struct list_head	ext_mounts;
 	struct list_head	inherit_fds;
 	struct list_head	external;
 	struct list_head	join_ns;
 	char			*libdir;
-	bool			use_page_server;
+	int			use_page_server;
 	unsigned short		port;
 	char			*addr;
 	int			ps_socket;
-	bool			track_mem;
+	int			track_mem;
 	char			*img_parent;
-	bool			auto_dedup;
+	int			auto_dedup;
 	unsigned int		cpu_cap;
-	bool			force_irmap;
+	int			force_irmap;
 	char			**exec_cmd;
 	unsigned int		manage_cgroups;
 	char			*new_global_cg_root;
@@ -99,17 +92,20 @@ struct cr_options {
 	char			*cgroup_props_file;
 	struct list_head	new_cgroup_roots;
 	bool			autodetect_ext_mounts;
-	bool			enable_external_sharing;
-	bool			enable_external_masters;
+	int			enable_external_sharing;
+	int			enable_external_masters;
 	bool			aufs;		/* auto-deteced, not via cli */
 	bool			overlayfs;
+#ifdef CONFIG_BINFMT_MISC_VIRTUALIZED
+	bool			has_binfmt_misc; /* auto-detected */
+#endif
 	size_t			ghost_limit;
 	struct list_head	irmap_scan_paths;
 	bool			lsm_supplied;
 	char			*lsm_profile;
 	unsigned int		timeout;
 	unsigned int		empty_ns;
-	bool			tcp_skip_in_flight;
+	int			tcp_skip_in_flight;
 	char			*work_dir;
 
 	/*
@@ -118,13 +114,16 @@ struct cr_options {
 	 * the deprecated stuff is not working, but it's still possible
 	 * to turn one ON while the code is in.
 	 */
-	bool			deprecated_ok;
+	int			deprecated_ok;
+	int			display_stats;
+	int			weak_sysctls;
+	int			status_fd;
+	bool			orphan_pts_master;
+	int 			use_pmem;
 };
 
 extern struct cr_options opts;
 
 extern void init_opts(void);
-
-extern int add_external(char *key);
 
 #endif /* __CR_OPTIONS_H__ */

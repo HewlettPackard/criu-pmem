@@ -1,12 +1,12 @@
 #include <unistd.h>
 
-#include "asm/string.h"
 #include "asm/types.h"
 
-#include "syscall.h"
+#include <compel/plugins/std/string.h>
+#include <compel/plugins/std/syscall.h>
 #include "parasite-vdso.h"
 #include "log.h"
-#include "bug.h"
+#include "common/bug.h"
 
 #ifdef LOG_PREFIX
 # undef LOG_PREFIX
@@ -104,7 +104,7 @@ static unsigned long put_trampoline(unsigned long at, struct vdso_symtable *sym)
 
 			pr_debug("Putting vDSO trampoline in %s at %lx\n",
 				 sym->symbols[i].name, trampoline);
-			builtin_memcpy((void *)trampoline, &vdso_trampoline,
+			memcpy((void *)trampoline, &vdso_trampoline,
 				       size);
 			invalidate_caches(trampoline);
 		}
@@ -125,10 +125,9 @@ static inline void put_trampoline_call(unsigned long at, unsigned long to,
     invalidate_caches(at);
 }
 
-int vdso_redirect_calls(unsigned long base_to,
-			unsigned long base_from,
-			struct vdso_symtable *to,
-			struct vdso_symtable *from)
+int vdso_redirect_calls(unsigned long base_to, unsigned long base_from,
+			struct vdso_symtable *to, struct vdso_symtable *from,
+			bool __always_unused compat_vdso)
 {
 	unsigned int i;
 	unsigned long trampoline;

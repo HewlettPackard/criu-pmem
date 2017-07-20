@@ -9,15 +9,19 @@
 #include <sys/wait.h>
 #include <time.h>
 
-#include "compiler.h"
+#include "int.h"
+#include "common/compiler.h"
 #include "cr_options.h"
 #include "cr-errno.h"
 #include "pstree.h"
-#include "ptrace.h"
+#include "criu-log.h"
+#include <compel/ptrace.h>
+#include "proc_parse.h"
 #include "seize.h"
 #include "stats.h"
 #include "xmalloc.h"
 #include "util.h"
+#include <compel/compel.h>
 
 #define NR_ATTEMPTS 5
 
@@ -89,6 +93,10 @@ static int freezer_restore_state(void)
 	return 0;
 }
 
+/* A number of tasks in a freezer cgroup which are not going to be dumped */
+static int processes_to_wait;
+static pid_t *processes_to_wait_pids;
+
 static int seize_cgroup_tree(char *root_path, const char *state)
 {
 	DIR *dir;
@@ -122,7 +130,7 @@ static int seize_cgroup_tree(char *root_path, const char *state)
 			return -1;
 		}
 
-		if (!seize_catch_task(pid)) {
+		if (!compel_interrupt_task(pid)) {
 			pr_debug("SEIZE %d: success\n", pid);
 			processes_to_wait++;
 		} else if (state == frozen) {
@@ -133,11 +141,16 @@ static int seize_cgroup_tree(char *root_path, const char *state)
 			snprintf(buf, sizeof(buf), "/proc/%d/exe", pid);
 			if (stat(buf, &st) == -1 && errno == ENOENT)
 				continue;
-
-			/* fails when meets a zombie */
+			/*
+			 * fails when meets a zombie, or eixting process:
+			 * there is a small race in a kernel -- the process
+			 * may start exiting and we are trying to freeze it
+			 * before it compete exit procedure. The caller simply
+			 * should wait a bit and try freezing again.
+			 */
 			pr_err("zombie found while seizing\n");
 			fclose(f);
-			return -1;
+			return -EAGAIN;
 		}
 	}
 	fclose(f);
@@ -150,6 +163,7 @@ static int seize_cgroup_tree(char *root_path, const char *state)
 
 	while ((de = readdir(dir))) {
 		struct stat st;
+		int ret;
 
 		if (dir_dots(de))
 			continue;
@@ -164,20 +178,16 @@ static int seize_cgroup_tree(char *root_path, const char *state)
 
 		if (!S_ISDIR(st.st_mode))
 			continue;
-
-		if (seize_cgroup_tree(path, state) < 0) {
+		ret = seize_cgroup_tree(path, state);
+		if (ret < 0) {
 			closedir(dir);
-			return -1;
+			return ret;
 		}
 	}
 	closedir(dir);
 
 	return 0;
 }
-
-/* A number of tasks in a freezer cgroup which are not going to be dumped */
-int processes_to_wait;
-static pid_t *processes_to_wait_pids;
 
 /*
  * A freezer cgroup can contain tasks which will not be dumped
@@ -265,7 +275,7 @@ static int log_unfrozen_stacks(char *root)
 
 		stack = open_proc(pid, "stack");
 		if (stack < 0) {
-			pr_perror("couldn't log %d's stack", pid);
+			pr_err("`- couldn't log %d's stack\n", pid);
 			fclose(f);
 			return -1;
 		}
@@ -325,7 +335,7 @@ static int freeze_processes(void)
 
 	static const unsigned long step_ms = 100;
 	unsigned long nr_attempts = (opts.timeout * 1000000) / step_ms;
-	unsigned long i;
+	unsigned long i = 0;
 
 	const struct timespec req = {
 		.tv_nsec	= step_ms * 1000000,
@@ -371,7 +381,7 @@ static int freeze_processes(void)
 		 * not read @tasks pids while freezer in
 		 * transition stage.
 		 */
-		for (i = 0; i <= nr_attempts; i++) {
+		for (; i <= nr_attempts; i++) {
 			state = get_freezer_state(fd);
 			if (!state) {
 				close(fd);
@@ -395,7 +405,18 @@ static int freeze_processes(void)
 		pr_debug("freezing processes: %lu attempts done\n", i);
 	}
 
-	exit_code = seize_cgroup_tree(opts.freeze_cgroup, state);
+	/*
+	 * Pay attention on @i variable -- it's continuation.
+	 */
+	for (; i <= nr_attempts; i++) {
+		exit_code = seize_cgroup_tree(opts.freeze_cgroup, state);
+		if (exit_code == -EAGAIN) {
+			if (alarm_timeouted())
+				goto err;
+			nanosleep(&req, NULL);
+		} else
+			break;
+	}
 
 err:
 	if (exit_code == 0 || freezer_thawed) {
@@ -418,7 +439,7 @@ static inline bool child_collected(struct pstree_item *i, pid_t pid)
 	struct pstree_item *c;
 
 	list_for_each_entry(c, &i->children, sibling)
-		if (c->pid.real == pid)
+		if (c->pid->real == pid)
 			return true;
 
 	return false;
@@ -430,13 +451,14 @@ static int collect_children(struct pstree_item *item)
 	pid_t *ch;
 	int ret, i, nr_children, nr_inprogress;
 
-	ret = parse_children(item->pid.real, &ch, &nr_children);
+	ret = parse_children(item->pid->real, &ch, &nr_children);
 	if (ret < 0)
 		return ret;
 
 	nr_inprogress = 0;
 	for (i = 0; i < nr_children; i++) {
 		struct pstree_item *c;
+		struct proc_status_creds *creds;
 		pid_t pid = ch[i];
 
 		/* Is it already frozen? */
@@ -460,9 +482,15 @@ static int collect_children(struct pstree_item *item)
 
 		if (!opts.freeze_cgroup)
 			/* fails when meets a zombie */
-			seize_catch_task(pid);
+			compel_interrupt_task(pid);
 
-		ret = seize_wait_task(pid, item->pid.real, &dmpi(c)->pi_creds);
+		creds = xzalloc(sizeof(*creds));
+		if (!creds) {
+			ret = -1;
+			goto free;
+		}
+
+		ret = compel_wait_task(pid, item->pid->real, parse_pid_status, NULL, &creds->s, NULL);
 		if (ret < 0) {
 			/*
 			 * Here is a race window between parse_children() and seize(),
@@ -473,12 +501,19 @@ static int collect_children(struct pstree_item *item)
 			 */
 			ret = 0;
 			xfree(c);
+			xfree(creds);
 			continue;
 		}
 
-		c->pid.real = pid;
+		if (ret == TASK_ZOMBIE)
+			ret = TASK_DEAD;
+		else
+			processes_to_wait--;
+
+		dmpi(c)->pi_creds = creds;
+		c->pid->real = pid;
 		c->parent = item;
-		c->pid.state = ret;
+		c->pid->state = ret;
 		list_add_tail(&c->sibling, &item->children);
 
 		/* Here is a recursive call (Depth-first search) */
@@ -495,7 +530,7 @@ static void unseize_task_and_threads(const struct pstree_item *item, int st)
 {
 	int i;
 
-	if (item->pid.state == TASK_DEAD)
+	if (item->pid->state == TASK_DEAD)
 		return;
 
 	/*
@@ -503,7 +538,7 @@ static void unseize_task_and_threads(const struct pstree_item *item, int st)
 	 * the item->state is the state task was in when we seized one.
 	 */
 
-	unseize_task(item->pid.real, item->pid.state, st);
+	compel_resume_task(item->pid->real, item->pid->state, st);
 
 	if (st == TASK_DEAD)
 		return;
@@ -520,7 +555,7 @@ static void pstree_wait(struct pstree_item *root_item)
 
 	for_each_pstree_item(item) {
 
-		if (item->pid.state == TASK_DEAD)
+		if (item->pid->state == TASK_DEAD)
 			continue;
 
 		for (i = 0; i < item->nr_threads; i++) {
@@ -574,14 +609,14 @@ void pstree_switch_state(struct pstree_item *root_item, int st)
 static pid_t item_ppid(const struct pstree_item *item)
 {
 	item = item->parent;
-	return item ? item->pid.real : -1;
+	return item ? item->pid->real : -1;
 }
 
 static inline bool thread_collected(struct pstree_item *i, pid_t tid)
 {
 	int t;
 
-	if (i->pid.real == tid) /* thread leader is collected as task */
+	if (i->pid->real == tid) /* thread leader is collected as task */
 		return true;
 
 	for (t = 0; t < i->nr_threads; t++)
@@ -591,16 +626,65 @@ static inline bool thread_collected(struct pstree_item *i, pid_t tid)
 	return false;
 }
 
+static bool creds_dumpable(struct proc_status_creds *parent,
+				struct proc_status_creds *child)
+{
+	size_t size;
+	/*
+	 * The comparison rules are the following
+	 *
+	 *  - CAPs can be different
+	 *  - seccomp filters should be passed via
+	 *    semantic comparison (FIXME) but for
+	 *    now we require them to be exactly
+	 *    identical
+	 *  - sigpnd may be different
+	 *  - the rest of members must match
+	 */
+
+	size = offsetof(struct proc_status_creds, cap_inh) -
+	       sizeof(parent->s.sigpnd);
+
+	if (memcmp(&parent->s.sigpnd, &child->s.sigpnd, size)) {
+		if (!pr_quelled(LOG_DEBUG)) {
+			pr_debug("Creds undumpable (parent:child)\n"
+				 "  uids:               %d:%d %d:%d %d:%d %d:%d\n"
+				 "  gids:               %d:%d %d:%d %d:%d %d:%d\n"
+				 "  state:              %d:%d"
+				 "  ppid:               %d:%d\n"
+				 "  shdpnd:             %llu:%llu\n"
+				 "  seccomp_mode:       %d:%d\n"
+				 "  last_filter:        %u:%u\n",
+				 parent->uids[0], child->uids[0],
+				 parent->uids[1], child->uids[1],
+				 parent->uids[2], child->uids[2],
+				 parent->uids[3], child->uids[3],
+				 parent->gids[0], child->gids[0],
+				 parent->gids[1], child->gids[1],
+				 parent->gids[2], child->gids[2],
+				 parent->gids[3], child->gids[3],
+				 parent->s.state, child->s.state,
+				 parent->s.ppid, child->s.ppid,
+				 parent->s.shdpnd, child->s.shdpnd,
+				 parent->s.seccomp_mode, child->s.seccomp_mode,
+				 parent->last_filter, child->last_filter);
+		}
+		return false;
+	}
+
+	return true;
+}
+
 static int collect_threads(struct pstree_item *item)
 {
 	struct pid *threads = NULL;
 	int nr_threads = 0, i = 0, ret, nr_inprogress, nr_stopped = 0;
 
-	ret = parse_threads(item->pid.real, &threads, &nr_threads);
+	ret = parse_threads(item->pid->real, &threads, &nr_threads);
 	if (ret < 0)
 		goto err;
 
-	if ((item->pid.state == TASK_DEAD) && (nr_threads > 1)) {
+	if ((item->pid->state == TASK_DEAD) && (nr_threads > 1)) {
 		pr_err("Zombies with threads are not supported\n");
 		goto err;
 	}
@@ -611,13 +695,15 @@ static int collect_threads(struct pstree_item *item)
 		return -1;
 
 	if (item->nr_threads == 0) {
-		item->threads[0].real = item->pid.real;
+		item->threads[0].real = item->pid->real;
 		item->nr_threads = 1;
+		item->threads[0].item = NULL;
 	}
 
 	nr_inprogress = 0;
 	for (i = 0; i < nr_threads; i++) {
 		pid_t pid = threads[i].real;
+		struct proc_status_creds t_creds = {};
 
 		if (thread_collected(item, pid))
 			continue;
@@ -625,12 +711,12 @@ static int collect_threads(struct pstree_item *item)
 		nr_inprogress++;
 
 		pr_info("\tSeizing %d's %d thread\n",
-				item->pid.real, pid);
+				item->pid->real, pid);
 
-		if (!opts.freeze_cgroup && seize_catch_task(pid))
+		if (!opts.freeze_cgroup && compel_interrupt_task(pid))
 			continue;
 
-		ret = seize_wait_task(pid, item_ppid(item), &dmpi(item)->pi_creds);
+		ret = compel_wait_task(pid, item_ppid(item), parse_pid_status, NULL, &t_creds.s, NULL);
 		if (ret < 0) {
 			/*
 			 * Here is a race window between parse_threads() and seize(),
@@ -642,14 +728,23 @@ static int collect_threads(struct pstree_item *item)
 			continue;
 		}
 
+		if (ret == TASK_ZOMBIE)
+			ret = TASK_DEAD;
+		else
+			processes_to_wait--;
+
 		BUG_ON(item->nr_threads + 1 > nr_threads);
 		item->threads[item->nr_threads].real = pid;
+		item->threads[item->nr_threads].item = NULL;
 		item->nr_threads++;
 
 		if (ret == TASK_DEAD) {
 			pr_err("Zombie thread not supported\n");
 			goto err;
 		}
+
+		if (!creds_dumpable(dmpi(item)->pi_creds, &t_creds))
+			goto err;
 
 		if (ret == TASK_STOPPED) {
 			nr_stopped++;
@@ -717,7 +812,7 @@ static int collect_task(struct pstree_item *item)
 	if (ret < 0)
 		goto err_close;
 
-	if ((item->pid.state == TASK_DEAD) && !list_empty(&item->children)) {
+	if ((item->pid->state == TASK_DEAD) && !list_empty(&item->children)) {
 		pr_err("Zombie with children?! O_o Run, run, run!\n");
 		goto err_close;
 	}
@@ -725,7 +820,7 @@ static int collect_task(struct pstree_item *item)
 	if (pstree_alloc_cores(item))
 		goto err_close;
 
-	pr_info("Collected %d in %d state\n", item->pid.real, item->pid.state);
+	pr_info("Collected %d in %d state\n", item->pid->real, item->pid->state);
 	return 0;
 
 err_close:
@@ -735,8 +830,9 @@ err_close:
 
 int collect_pstree(void)
 {
-	pid_t pid = root_item->pid.real;
+	pid_t pid = root_item->pid->real;
 	int ret = -1;
+	struct proc_status_creds *creds;
 
 	timing_start(TIME_FREEZING);
 
@@ -750,16 +846,27 @@ int collect_pstree(void)
 	if (opts.freeze_cgroup && freeze_processes())
 		goto err;
 
-	if (!opts.freeze_cgroup && seize_catch_task(pid)) {
+	if (!opts.freeze_cgroup && compel_interrupt_task(pid)) {
 		set_cr_errno(ESRCH);
 		goto err;
 	}
 
-	ret = seize_wait_task(pid, -1, &dmpi(root_item)->pi_creds);
+	creds = xzalloc(sizeof(*creds));
+	if (!creds)
+		goto err;
+
+	ret = compel_wait_task(pid, -1, parse_pid_status, NULL, &creds->s, NULL);
 	if (ret < 0)
 		goto err;
+
+	if (ret == TASK_ZOMBIE)
+		ret = TASK_DEAD;
+	else
+		processes_to_wait--;
+
 	pr_info("Seized task %d, state %d\n", pid, ret);
-	root_item->pid.state = ret;
+	root_item->pid->state = ret;
+	dmpi(root_item)->pi_creds = creds;
 
 	ret = collect_task(root_item);
 	if (ret < 0)

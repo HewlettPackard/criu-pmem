@@ -17,7 +17,7 @@ SUBARCH := $(shell uname -m | sed       \
                 -e s/ppc64.*/ppc64/     \
                 -e s/mips.*/mips/       \
                 -e s/sh[234].*/sh/      \
-                -e s/aarch64.*/arm64/)
+                -e s/aarch64.*/aarch64/)
 
 ARCH		?= $(SUBARCH)
 SRCARCH 	:= $(ARCH)
@@ -30,7 +30,7 @@ endif
 
 # Do not use make's built-in rules and variables
 # (this increases performance and avoids hard-to-debug behaviour).
-MAKEFLAGS += -rR
+MAKEFLAGS += -rR --no-print-directory
 export MAKEFLAGS
 
 # Avoid funny character set dependencies.
@@ -52,7 +52,5 @@ export build-as
 
 #
 # Footer.
-$(__nmk_dir)scripts/include.mk:
-	@true
 ____nmk_defined__include = y
 endif

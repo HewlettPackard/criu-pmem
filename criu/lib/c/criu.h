@@ -32,13 +32,13 @@ enum criu_service_comm {
 };
 
 enum criu_cg_mode {
-	CRIU_CG_MODE_IGNORE	= 0,
-	CRIU_CG_MODE_NONE	= 1,
-	CRIU_CG_MODE_PROPS	= 2,
-	CRIU_CG_MODE_SOFT	= 3,
-	CRIU_CG_MODE_FULL	= 4,
-	CRIU_CG_MODE_STRICT	= 5,
-	CRIU_CG_MODE_DEFAULT	= 6
+	CRIU_CG_MODE_IGNORE,
+	CRIU_CG_MODE_NONE,
+	CRIU_CG_MODE_PROPS,
+	CRIU_CG_MODE_SOFT,
+	CRIU_CG_MODE_FULL,
+	CRIU_CG_MODE_STRICT,
+	CRIU_CG_MODE_DEFAULT,
 };
 
 void criu_set_service_address(char *path);
@@ -66,6 +66,7 @@ void criu_set_ext_unix_sk(bool ext_unix_sk);
 int criu_add_unix_sk(unsigned int inode);
 void criu_set_tcp_established(bool tcp_established);
 void criu_set_tcp_skip_in_flight(bool tcp_skip_in_flight);
+void criu_set_weak_sysctls(bool val);
 void criu_set_evasive_devices(bool evasive_devices);
 void criu_set_shell_job(bool shell_job);
 void criu_set_file_locks(bool file_locks);
@@ -92,6 +93,8 @@ int criu_add_enable_fs(char *fs);
 int criu_add_skip_mnt(char *mnt);
 void criu_set_ghost_limit(unsigned int limit);
 int criu_add_irmap_path(char *path);
+int criu_add_inherit_fd(int fd, char *key);
+int criu_add_external(char *key);
 
 /*
  * The criu_notify_arg_t na argument is an opaque
@@ -171,6 +174,7 @@ void criu_local_set_ext_unix_sk(criu_opts *opts, bool ext_unix_sk);
 int criu_local_add_unix_sk(criu_opts *opts, unsigned int inode);
 void criu_local_set_tcp_established(criu_opts *opts, bool tcp_established);
 void criu_local_set_tcp_skip_in_flight(criu_opts *opts, bool tcp_skip_in_flight);
+void criu_local_set_weak_sysctls(criu_opts *opts, bool val);
 void criu_local_set_evasive_devices(criu_opts *opts, bool evasive_devices);
 void criu_local_set_shell_job(criu_opts *opts, bool shell_job);
 void criu_local_set_file_locks(criu_opts *opts, bool file_locks);
@@ -200,6 +204,8 @@ int criu_local_add_irmap_path(criu_opts *opts, char *path);
 int criu_local_add_cg_props(criu_opts *opts, char *stream);
 int criu_local_add_cg_props_file(criu_opts *opts, char *path);
 int criu_local_add_cg_dump_controller(criu_opts *opts, char *name);
+int criu_local_add_inherit_fd(criu_opts *opts, int fd, char *key);
+int criu_local_add_external(criu_opts *opts, char *key);
 
 void criu_local_set_notify_cb(criu_opts *opts, int (*cb)(char *action, criu_notify_arg_t na));
 

@@ -13,15 +13,16 @@
 #include <sys/un.h>
 #include <stdlib.h>
 
+#include "types.h"
 #include "files.h"
 #include "file-ids.h"
 #include "files-reg.h"
 #include "file-lock.h"
 #include "image.h"
-#include "list.h"
+#include "common/list.h"
 #include "rst-malloc.h"
 #include "util-pie.h"
-#include "lock.h"
+#include "common/lock.h"
 #include "sockets.h"
 #include "pstree.h"
 #include "tty.h"
@@ -40,11 +41,11 @@
 #include "fdinfo.h"
 #include "cr_options.h"
 #include "autofs.h"
-
 #include "parasite.h"
 #include "parasite-syscall.h"
 
 #include "protobuf.h"
+#include "util.h"
 #include "images/fs.pb-c.h"
 #include "images/ext-file.pb-c.h"
 
@@ -97,11 +98,13 @@ static inline struct file_desc *find_file_desc(FdinfoEntry *fe)
 	return find_file_desc_raw(fe->type, fe->id);
 }
 
-struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd)
+struct fdinfo_list_entry *find_used_fd(struct pstree_item *task, int fd)
 {
+	struct list_head *head;
 	struct fdinfo_list_entry *fle;
 
-	list_for_each_entry_reverse(fle, head, used_list) {
+	head = &rsti(task)->fds;
+	list_for_each_entry_reverse(fle, head, ps_list) {
 		if (fle->fe->fd == fd)
 			return fle;
 		/* List is ordered, so let's stop */
@@ -111,19 +114,34 @@ struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd)
 	return NULL;
 }
 
-unsigned int find_unused_fd(struct list_head *head, int hint_fd)
+void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
 {
+	struct fdinfo_list_entry *fle;
+
+	/* fles in fds list are ordered by fd */
+	list_for_each_entry(fle, &ri->fds, ps_list) {
+		if (new_fle->fe->fd < fle->fe->fd)
+			break;
+	}
+
+	list_add_tail(&new_fle->ps_list, &fle->ps_list);
+}
+
+unsigned int find_unused_fd(struct pstree_item *task, int hint_fd)
+{
+	struct list_head *head;
 	struct fdinfo_list_entry *fle;
 	int fd = 0, prev_fd;
 
-	if ((hint_fd >= 0) && (!find_used_fd(head, hint_fd))) {
+	if ((hint_fd >= 0) && (!find_used_fd(task, hint_fd))) {
 		fd = hint_fd;
 		goto out;
 	}
 
 	prev_fd = service_fd_min_fd() - 1;
+	head = &rsti(task)->fds;
 
-	list_for_each_entry_reverse(fle, head, used_list) {
+	list_for_each_entry_reverse(fle, head, ps_list) {
 		fd = fle->fe->fd;
 		if (prev_fd > fd) {
 			fd++;
@@ -136,38 +154,38 @@ out:
 	return fd;
 }
 
-/*
- * A file may be shared between several file descriptors. E.g
- * when doing a fork() every fd of a forker and respective fds
- * of the child have such. Another way of getting shared files
- * is by dup()-ing them or sending them via unix sockets in
- * SCM_RIGHTS message.
- *
- * We restore this type of things in 3 steps (states[] below)
- *
- * 1. Prepare step.
- *    Select which task will create the file (open() one, or
- *    call any other syscall for than (socket, pipe, etc.). All
- *    the others, that share one, create unix sockets under the
- *    respective file descriptor (transport socket).
- * 2. Open step.
- *    The one who creates the file (the 'master') creates one,
- *    then creates one more unix socket (transport) and sends the
- *    created file over this socket to the other recipients.
- * 3. Receive step.
- *    Those, who wait for the file to appear, receive one via
- *    the transport socket, then close the socket and dup() the
- *    received file descriptor into its place.
- *
- * There's the 4th step in the states[] array -- the post_open
- * one. This one is not about file-sharing resolving, but about
- * doing something with a file using it's 'desired' fd. The
- * thing is that while going the 3-step process above, the file
- * may appear in variuos places in the task's fd table, and if
- * we want to do something with it's _final_ descriptor value,
- * we should wait for it to appear there. So the post_open is
- * called when the file is finally set into its place.
- */
+int set_fds_event(pid_t virt)
+{
+	struct pstree_item *item;
+	bool is_set;
+
+	item = pstree_item_by_virt(virt);
+	BUG_ON(!item);
+
+	is_set = !!test_and_set_bit_le(FDS_EVENT_BIT, &item->task_st_le_bits);
+
+	if (!is_set)
+		futex_wake(&item->task_st);
+	return 0;
+}
+
+void clear_fds_event(void)
+{
+	clear_bit_le(FDS_EVENT_BIT, &current->task_st_le_bits);
+}
+
+void wait_fds_event(void)
+{
+	futex_t *f = &current->task_st;
+	int value;
+#if BITS_PER_LONG == 64
+	value = htole64(FDS_EVENT);
+#else
+	value = htole32(FDS_EVENT);
+#endif
+	futex_wait_if_cond(f, value, &);
+	clear_fds_event();
+}
 
 struct fdinfo_list_entry *file_master(struct file_desc *d)
 {
@@ -304,12 +322,12 @@ int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link)
 	return 0;
 }
 
-static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
+static int fill_fd_params(struct pid *owner_pid, int fd, int lfd,
 				struct fd_opts *opts, struct fd_parms *p)
 {
 	int ret;
 	struct statfs fsbuf;
-	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = ctl->pid.virt };
+	struct fdinfo_common fdinfo = { .mnt_id = -1, .owner = owner_pid->ns[0].virt };
 
 	if (fstat(lfd, &p->stat) < 0) {
 		pr_perror("Can't stat fd %d", lfd);
@@ -321,22 +339,21 @@ static int fill_fd_params(struct parasite_ctl *ctl, int fd, int lfd,
 		return -1;
 	}
 
-	if (parse_fdinfo_pid(ctl->pid.real, fd, FD_TYPES__UND, NULL, &fdinfo))
+	if (parse_fdinfo_pid(owner_pid->real, fd, FD_TYPES__UND, NULL, &fdinfo))
 		return -1;
 
 	p->fs_type	= fsbuf.f_type;
-	p->ctl		= ctl;
 	p->fd		= fd;
 	p->pos		= fdinfo.pos;
 	p->flags	= fdinfo.flags;
 	p->mnt_id	= fdinfo.mnt_id;
-	p->pid		= ctl->pid.real;
+	p->pid		= owner_pid->real;
 	p->fd_flags	= opts->flags;
 
 	fown_entry__init(&p->fown);
 
 	pr_info("%d fdinfo %d: pos: %#16"PRIx64" flags: %16o/%#x\n",
-		ctl->pid.real, fd, p->pos, p->flags, (int)p->fd_flags);
+			owner_pid->real, fd, p->pos, p->flags, (int)p->fd_flags);
 
 	ret = fcntl(lfd, F_GETSIG, 0);
 	if (ret < 0) {
@@ -426,20 +443,22 @@ static int dump_chrdev(struct fd_parms *p, int lfd, struct cr_img *img)
 	return do_dump_gen_file(p, lfd, ops, img);
 }
 
-static int dump_one_file(struct parasite_ctl *ctl, int fd, int lfd, struct fd_opts *opts,
-		       struct cr_img *img)
+static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
+		       struct cr_img *img, struct parasite_ctl *ctl)
 {
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
 	struct fd_link link;
 
-	if (fill_fd_params(ctl, fd, lfd, opts, &p) < 0) {
+	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
 		pr_err("Can't get stat on %d\n", fd);
 		return -1;
 	}
 
-	if (note_file_lock(&ctl->pid, fd, lfd, &p))
+	if (note_file_lock(pid, fd, lfd, &p))
 		return -1;
+
+	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
 
 	if (S_ISSOCK(p.stat.st_mode))
 		return dump_socket(&p, lfd, img);
@@ -515,7 +534,7 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 	int off, nr_fds = min((int) PARASITE_MAX_FDS, dfds->nr_fds);
 
 	pr_info("\n");
-	pr_info("Dumping opened files (pid: %d)\n", ctl->pid.real);
+	pr_info("Dumping opened files (pid: %d)\n", item->pid->real);
 	pr_info("----------------------------------------\n");
 
 	lfds = xmalloc(nr_fds * sizeof(int));
@@ -541,8 +560,8 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item,
 			goto err;
 
 		for (i = 0; i < nr_fds; i++) {
-			ret = dump_one_file(ctl, dfds->fds[i + off],
-						lfds[i], opts + i, img);
+			ret = dump_one_file(item->pid, dfds->fds[i + off],
+						lfds[i], opts + i, img, ctl);
 			close(lfds[i]);
 			if (ret)
 				break;
@@ -619,11 +638,10 @@ int restore_fown(int fd, FownEntry *fown)
 {
 	struct f_owner_ex owner;
 	uid_t uids[3];
-	pid_t pid = getpid();
 
 	if (fown->signum) {
 		if (fcntl(fd, F_SETSIG, fown->signum)) {
-			pr_perror("%d: Can't set signal", pid);
+			pr_perror("Can't set signal");
 			return -1;
 		}
 	}
@@ -633,12 +651,12 @@ int restore_fown(int fd, FownEntry *fown)
 		return 0;
 
 	if (getresuid(&uids[0], &uids[1], &uids[2])) {
-		pr_perror("%d: Can't get current UIDs", pid);
+		pr_perror("Can't get current UIDs");
 		return -1;
 	}
 
 	if (setresuid(fown->uid, fown->euid, uids[2])) {
-		pr_perror("%d: Can't set UIDs", pid);
+		pr_perror("Can't set UIDs");
 		return -1;
 	}
 
@@ -646,13 +664,12 @@ int restore_fown(int fd, FownEntry *fown)
 	owner.pid = fown->pid;
 
 	if (fcntl(fd, F_SETOWN_EX, &owner)) {
-		pr_perror("%d: Can't setup %d file owner pid",
-			  pid, fd);
+		pr_perror("Can't setup %d file owner pid", fd);
 		return -1;
 	}
 
 	if (setresuid(uids[0], uids[1], uids[2])) {
-		pr_perror("%d: Can't revert UIDs back", pid);
+		pr_perror("Can't revert UIDs back");
 		return -1;
 	}
 
@@ -680,9 +697,7 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 	if (!new_le)
 		return -1;
 
-	futex_init(&new_le->real_pid);
-	new_le->pid = pid;
-	new_le->fe = e;
+	fle_init(new_le, pid, e);
 
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
@@ -696,10 +711,8 @@ static int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info)
 
 	if (fdesc->ops->collect_fd)
 		fdesc->ops->collect_fd(fdesc, new_le, rst_info);
-	else
-		collect_gen_fd(new_le, rst_info);
 
-	collect_used_fd(new_le, rst_info);
+	collect_task_fd(new_le, rst_info);
 
 	list_add_tail(&new_le->desc_list, &le->desc_list);
 	new_le->desc = fdesc;
@@ -733,7 +746,7 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 	if (!e)
 		return -1;
 
-	return collect_fd(task->pid.virt, e, rsti(task));
+	return collect_fd(vpid(task), e, rsti(task));
 }
 
 int prepare_ctl_tty(int pid, struct rst_info *rst_info, u32 ctl_tty_id)
@@ -767,19 +780,15 @@ int prepare_fd_pid(struct pstree_item *item)
 {
 	int ret = 0;
 	struct cr_img *img;
-	pid_t pid = item->pid.virt;
+	pid_t pid = vpid(item);
 	struct rst_info *rst_info = rsti(item);
 
-	INIT_LIST_HEAD(&rst_info->used);
 	INIT_LIST_HEAD(&rst_info->fds);
-	INIT_LIST_HEAD(&rst_info->eventpoll);
-	INIT_LIST_HEAD(&rst_info->tty_slaves);
-	INIT_LIST_HEAD(&rst_info->tty_ctty);
 
 	if (item->ids == NULL) /* zombie */
 		return 0;
 
-	if (rsti(item)->fdt && rsti(item)->fdt->pid != item->pid.virt)
+	if (rsti(item)->fdt && rsti(item)->fdt->pid != vpid(item))
 		return 0;
 
 	img = open_image(CR_FD_FDINFO, O_RSTR, item->ids->files_id);
@@ -845,118 +854,98 @@ err:
 struct fd_open_state {
 	char *name;
 	int (*cb)(int, struct fdinfo_list_entry *);
-
-	/*
-	 * Two last stages -- receive fds and post-open them -- are
-	 * not required always. E.g. if no fd sharing takes place
-	 * or task doens't have any files that need to be post-opened.
-	 *
-	 * Thus, in order not to scan through fdinfo-s lists in vain
-	 * and speed things up a little bit, we may want to skeep these.
-	 */
-	bool required;
 };
 
-static int open_transport_fd(int pid, struct fdinfo_list_entry *fle);
-static int open_fd(int pid, struct fdinfo_list_entry *fle);
-static int receive_fd(int pid, struct fdinfo_list_entry *fle);
-static int post_open_fd(int pid, struct fdinfo_list_entry *fle);
+static int receive_fd(struct fdinfo_list_entry *fle);
 
-static struct fd_open_state states[] = {
-	{ "prepare",		open_transport_fd,	true,},
-	{ "create",		open_fd,		true,},
-	{ "receive",		receive_fd,		false,},
-	{ "post_create",	post_open_fd,		false,},
-};
-
-#define want_recv_stage()	do { states[2].required = true; } while (0)
-#define want_post_open_stage()	do { states[3].required = true; } while (0)
-
-static void transport_name_gen(struct sockaddr_un *addr, int *len,
-		int pid, int fd)
+static void transport_name_gen(struct sockaddr_un *addr, int *len, int pid)
 {
 	addr->sun_family = AF_UNIX;
-	snprintf(addr->sun_path, UNIX_PATH_MAX, "x/crtools-fd-%d-%d", pid, fd);
+	snprintf(addr->sun_path, UNIX_PATH_MAX, "x/crtools-fd-%d", pid);
 	*len = SUN_LEN(addr);
 	*addr->sun_path = '\0';
 }
 
-static int should_open_transport(FdinfoEntry *fe, struct file_desc *fd)
+static bool task_fle(struct pstree_item *task, struct fdinfo_list_entry *fle)
 {
-	if (fd->ops->want_transport)
-		return fd->ops->want_transport(fe, fd);
-	else
-		return 0;
+	struct fdinfo_list_entry *tmp;
+
+	list_for_each_entry(tmp, &rsti(task)->fds, ps_list)
+		if (fle == tmp)
+			return true;
+	return false;
 }
 
-static int open_transport_fd(int pid, struct fdinfo_list_entry *fle)
+static int plant_fd(struct fdinfo_list_entry *fle, int fd)
 {
-	struct fdinfo_list_entry *flem;
-	struct sockaddr_un saddr;
-	int sock;
-	int ret, sun_len;
+	BUG_ON(fle->received);
+	fle->received = 1;
+	return reopen_fd_as(fle->fe->fd, fd);
+}
 
-	flem = file_master(fle->desc);
+static int recv_fd_from_peer(struct fdinfo_list_entry *fle)
+{
+	struct fdinfo_list_entry *tmp;
+	int fd, ret, tsock;
 
-	if (flem->pid == pid) {
-		if (flem->fe->fd != fle->fe->fd)
-			/* dup-ed file. Will be opened in the open_fd */
-			return 0;
+	if (fle->received)
+		return 0;
 
-		if (!should_open_transport(fle->fe, fle->desc))
-			/* pure master file */
-			return 0;
+	tsock = get_service_fd(TRANSPORT_FD_OFF);
+	do {
+		ret = __recv_fds(tsock, &fd, 1, (void *)&tmp, sizeof(struct fdinfo_list_entry *), MSG_DONTWAIT);
+		if (ret == -EAGAIN || ret == -EWOULDBLOCK)
+			return 1;
+		else if (ret)
+			return -1;
 
-		/*
-		 * some master file, that wants a transport, e.g.
-		 * a pipe or unix socket pair 'slave' end
-		 */
-	}
-
-	transport_name_gen(&saddr, &sun_len, getpid(), fle->fe->fd);
-
-	pr_info("\t\tCreate transport fd %s\n", saddr.sun_path + 1);
-
-
-	sock = socket(PF_UNIX, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		pr_perror("Can't create socket");
-		return -1;
-	}
-	ret = bind(sock, (struct sockaddr *)&saddr, sun_len);
-	if (ret < 0) {
-		pr_perror("Can't bind unix socket %s", saddr.sun_path + 1);
-		goto err;
-	}
-
-	ret = reopen_fd_as(fle->fe->fd, sock);
-	if (ret < 0)
-		goto err;
-
-	pr_info("\t\tWake up fdinfo pid=%d fd=%d\n", fle->pid, fle->fe->fd);
-	futex_set_and_wake(&fle->real_pid, getpid());
-	want_recv_stage();
+		pr_info("Further fle=%p, pid=%d\n", tmp, fle->pid);
+		if (!task_fle(current, tmp)) {
+			pr_err("Unexpected fle %p, pid=%d\n", tmp, vpid(current));
+			return -1;
+		}
+		if (plant_fd(tmp, fd))
+			return -1;
+	} while (tmp != fle);
 
 	return 0;
-err:
-	close(sock);
-	return -1;
 }
 
-int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int sock)
+static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 {
 	struct sockaddr_un saddr;
-	int len;
+	int len, sock, ret;
 
-	pr_info("\t\tWait fdinfo pid=%d fd=%d\n", fle->pid, fle->fe->fd);
-	futex_wait_while(&fle->real_pid, 0);
-	transport_name_gen(&saddr, &len,
-			futex_get(&fle->real_pid), fle->fe->fd);
+	sock = get_service_fd(TRANSPORT_FD_OFF);
+
+	transport_name_gen(&saddr, &len, fle->pid);
 	pr_info("\t\tSend fd %d to %s\n", fd, saddr.sun_path + 1);
-	return send_fd(sock, &saddr, len, fd);
+	ret = send_fds(sock, &saddr, len, &fd, 1, (void *)&fle, sizeof(struct fdinfo_list_entry *));
+	if (ret < 0)
+		return -1;
+	return set_fds_event(fle->pid);
 }
 
-static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle, int sock)
+/*
+ * Helpers to scatter file_desc across users for those files, that
+ * create two descriptors from a single system call at once (e.g.
+ * ... or better i.e. -- pipes, socketpairs and ttys)
+ */
+int recv_desc_from_peer(struct file_desc *d, int *fd)
+{
+	struct fdinfo_list_entry *fle;
+
+	fle = file_master(d);
+	*fd = fle->fe->fd;
+	return recv_fd_from_peer(fle);
+}
+
+int send_desc_to_peer(int fd, struct file_desc *d)
+{
+	return send_fd_to_peer(fd, file_master(d));
+}
+
+static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle)
 {
 	int dfd = fle->fe->fd;
 
@@ -967,7 +956,7 @@ static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle, int sock)
 	if (inherit_fd_resolve_clash(dfd) < 0)
 		return -1;
 
-	BUG_ON(dfd == sock);
+	BUG_ON(dfd == get_service_fd(TRANSPORT_FD_OFF));
 
 	pr_info("\t\t\tGoing to dup %d into %d\n", fd, dfd);
 	if (dup2(fd, dfd) != dfd) {
@@ -980,40 +969,23 @@ static int send_fd_to_self(int fd, struct fdinfo_list_entry *fle, int sock)
 		return -1;
 	}
 
+	fle->received = 1;
+
 	return 0;
 }
 
-static int post_open_fd(int pid, struct fdinfo_list_entry *fle)
-{
-	struct file_desc *d = fle->desc;
-
-	if (!d->ops->post_open)
-		return 0;
-
-	if (is_service_fd(fle->fe->fd, CTL_TTY_OFF))
-		return d->ops->post_open(d, fle->fe->fd);
-
-	if (fle != file_master(d))
-		return 0;
-
-	return d->ops->post_open(d, fle->fe->fd);
-}
-
-
 static int serve_out_fd(int pid, int fd, struct file_desc *d)
 {
-	int sock, ret;
+	int ret;
 	struct fdinfo_list_entry *fle;
-
-	sock = get_service_fd(TRANSPORT_FD_OFF);
 
 	pr_info("\t\tCreate fd for %d\n", fd);
 
 	list_for_each_entry(fle, &d->fd_info_head, desc_list) {
 		if (pid == fle->pid)
-			ret = send_fd_to_self(fd, fle, sock);
+			ret = send_fd_to_self(fd, fle);
 		else
-			ret = send_fd_to_peer(fd, fle, sock);
+			ret = send_fd_to_peer(fd, fle);
 
 		if (ret) {
 			pr_err("Can't sent fd %d to %d\n", fd, fle->pid);
@@ -1026,20 +998,10 @@ out:
 	return ret;
 }
 
-static int open_fd(int pid, struct fdinfo_list_entry *fle)
+static int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 {
 	struct file_desc *d = fle->desc;
-	int new_fd;
-
-	if (d->ops->post_open)
-		want_post_open_stage();
-
-	if (fle != file_master(d))
-		return 0;
-
-	new_fd = d->ops->open(d);
-	if (new_fd < 0)
-		return -1;
+	pid_t pid = fle->pid;
 
 	if (reopen_fd_as(fle->fe->fd, new_fd))
 		return -1;
@@ -1049,29 +1011,72 @@ static int open_fd(int pid, struct fdinfo_list_entry *fle)
 		return -1;
 	}
 
-	return serve_out_fd(pid, fle->fe->fd, d);
+	BUG_ON(fle->stage != FLE_INITIALIZED);
+	fle->stage = FLE_OPEN;
+
+	if (serve_out_fd(pid, fle->fe->fd, d))
+		return -1;
+	return 0;
 }
 
-static int receive_fd(int pid, struct fdinfo_list_entry *fle)
+static int open_fd(struct fdinfo_list_entry *fle)
 {
-	int tmp;
+	struct file_desc *d = fle->desc;
 	struct fdinfo_list_entry *flem;
+	int new_fd = -1, ret;
 
-	flem = file_master(fle->desc);
-	if (flem->pid == pid)
-		return 0;
+	flem = file_master(d);
+	if (fle != flem) {
+		BUG_ON (fle->stage != FLE_INITIALIZED);
+		ret = receive_fd(fle);
+		if (ret != 0)
+			return ret;
+		goto fixup_ctty;
+	}
+
+	/*
+	 * Open method returns the following values:
+	 * 0  -- restore is successefuly finished;
+	 * 1  -- restore is in process or can't be started
+	 *       yet, because of it depends on another fles,
+	 *       so the method should be called once again;
+	 * -1 -- restore failed.
+	 * In case of 0 and 1 return values, new_fd may
+	 * be not negative. In this case it contains newly
+	 * opened file descriptor, which may be served out.
+	 * For every fle, new_fd is populated only once.
+	 * See setup_and_serve_out() BUG_ON for the details.
+	 */
+	ret = d->ops->open(d, &new_fd);
+	if (ret != -1 && new_fd >= 0) {
+		if (setup_and_serve_out(fle, new_fd) < 0)
+			return -1;
+	}
+fixup_ctty:
+	if (ret == 0) {
+		if (fle->fe->fd == get_service_fd(CTL_TTY_OFF)) {
+			ret = tty_restore_ctl_terminal(fle->desc, fle->fe->fd);
+			if (ret == -1)
+				return ret;
+		}
+
+		fle->stage = FLE_RESTORED;
+	}
+	return ret;
+}
+
+static int receive_fd(struct fdinfo_list_entry *fle)
+{
+	int ret;
 
 	pr_info("\tReceive fd for %d\n", fle->fe->fd);
 
-	tmp = recv_fd(fle->fe->fd);
-	if (tmp < 0) {
-		pr_err("Can't get fd %d\n", tmp);
-		return -1;
+	ret = recv_fd_from_peer(fle);
+	if (ret != 0) {
+		if (ret != 1)
+			pr_err("Can't get fd=%d, pid=%d\n", fle->fe->fd, fle->pid);
+		return ret;
 	}
-	close(fle->fe->fd);
-
-	if (reopen_fd_as(fle->fe->fd, tmp) < 0)
-		return -1;
 
 	if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
 		pr_perror("Unable to set file descriptor flags");
@@ -1081,23 +1086,45 @@ static int receive_fd(int pid, struct fdinfo_list_entry *fle)
 	return 0;
 }
 
-static int open_fdinfo(int pid, struct fdinfo_list_entry *fle, int state)
+static int open_fdinfos(struct pstree_item *me)
 {
-	pr_info("\tRestoring fd %d (state -> %s)\n",
-			fle->fe->fd, states[state].name);
-	return states[state].cb(pid, fle);
-}
+	struct list_head *list = &rsti(me)->fds;
+	struct fdinfo_list_entry *fle, *tmp;
+	LIST_HEAD(completed);
+	bool progress, again;
+	int st, ret = 0;
 
-static int open_fdinfos(int pid, struct list_head *list, int state)
-{
-	int ret = 0;
-	struct fdinfo_list_entry *fle;
+	do {
+		progress = again = false;
+		clear_fds_event();
 
-	list_for_each_entry(fle, list, ps_list) {
-		ret = open_fdinfo(pid, fle, state);
-		if (ret)
-			break;
-	}
+		list_for_each_entry_safe(fle, tmp, list, ps_list) {
+			st = fle->stage;
+			BUG_ON(st == FLE_RESTORED);
+			ret = open_fd(fle);
+			if (ret == -1)
+				goto splice;
+			if (st != fle->stage || ret == 0)
+				progress = true;
+			if (ret == 0) {
+				/*
+				 * We delete restored items from fds list,
+				 * so open() methods may base on this feature
+				 * and reduce number of fles in their checks.
+				 */
+				list_del(&fle->ps_list);
+				list_add(&fle->ps_list, &completed);
+			}
+			if (ret == 1)
+			       again = true;
+		}
+		if (!progress && again)
+			wait_fds_event();
+	} while (again || progress);
+
+	BUG_ON(!list_empty(list));
+splice:
+	list_splice(&completed, list);
 
 	return ret;
 }
@@ -1138,7 +1165,6 @@ int close_old_fds(void)
 int prepare_fds(struct pstree_item *me)
 {
 	u32 ret = 0;
-	int state;
 
 	pr_info("Opening fdinfo-s\n");
 
@@ -1162,59 +1188,16 @@ int prepare_fds(struct pstree_item *me)
 		futex_inc_and_wake(&fdt->fdt_lock);
 		futex_wait_while_lt(&fdt->fdt_lock, fdt->nr);
 
-		if (fdt->pid != me->pid.virt) {
+		if (fdt->pid != vpid(me)) {
 			pr_info("File descriptor table is shared with %d\n", fdt->pid);
 			futex_wait_until(&fdt->fdt_lock, fdt->nr + 1);
 			goto out;
 		}
 	}
 
-	for (state = 0; state < ARRAY_SIZE(states); state++) {
-		if (!states[state].required) {
-			pr_debug("Skipping %s fd stage\n", states[state].name);
-			continue;
-		}
+	ret = open_fdinfos(me);
 
-		ret = open_fdinfos(me->pid.virt, &rsti(me)->fds, state);
-		if (ret)
-			break;
-
-		/*
-		 * Now handle TTYs. Slaves are delayed to be sure masters
-		 * are already opened.
-		 */
-		ret = open_fdinfos(me->pid.virt, &rsti(me)->tty_slaves, state);
-		if (ret)
-			break;
-
-		/*
-		 * The eventpoll descriptors require all the other ones
-		 * to be already restored, thus we store them in a separate
-		 * list and restore at the very end.
-		 */
-		ret = open_fdinfos(me->pid.virt, &rsti(me)->eventpoll, state);
-		if (ret)
-			break;
-	}
-
-	if (ret)
-		goto out_w;
-
-	for (state = 0; state < ARRAY_SIZE(states); state++) {
-		if (!states[state].required) {
-			pr_debug("Skipping %s fd stage\n", states[state].name);
-			continue;
-		}
-
-		/*
-		 * Opening current TTYs require session to be already set up,
-		 * thus slave peers already handled now it's time for cttys,
-		 */
-		ret = open_fdinfos(me->pid.virt, &rsti(me)->tty_ctty, state);
-		if (ret)
-			break;
-	}
-out_w:
+	close_service_fd(TRANSPORT_FD_OFF);
 	if (rsti(me)->fdt)
 		futex_inc_and_wake(&rsti(me)->fdt->fdt_lock);
 out:
@@ -1295,7 +1278,7 @@ out:
 
 int prepare_fs_pid(struct pstree_item *item)
 {
-	pid_t pid = item->pid.virt;
+	pid_t pid = vpid(item);
 	struct rst_info *ri = rsti(item);
 	struct cr_img *img;
 	FsEntry *fe;
@@ -1346,15 +1329,15 @@ int shared_fdt_prepare(struct pstree_item *item)
 
 		futex_init(&fdt->fdt_lock);
 		fdt->nr = 1;
-		fdt->pid = parent->pid.virt;
+		fdt->pid = vpid(parent);
 	} else
 		fdt = rsti(parent)->fdt;
 
 	rsti(item)->fdt = fdt;
 	rsti(item)->service_fd_id = fdt->nr;
 	fdt->nr++;
-	if (pid_rst_prio(item->pid.virt, fdt->pid))
-		fdt->pid = item->pid.virt;
+	if (pid_rst_prio(vpid(item), fdt->pid))
+		fdt->pid = vpid(item);
 
 	return 0;
 }
@@ -1649,39 +1632,29 @@ int inherit_fd_fini()
 	return 0;
 }
 
-bool external_lookup_id(char *id)
+int open_transport_socket(void)
 {
-	struct external *ext;
+	struct fdt *fdt = rsti(current)->fdt;
+	pid_t pid = vpid(current);
+	struct sockaddr_un saddr;
+	int sock, slen;
 
-	list_for_each_entry(ext, &opts.external, node)
-		if (!strcmp(ext->id, id))
-			return true;
-	return false;
-}
-
-char *external_lookup_by_key(char *key)
-{
-	struct external *ext;
-	int len = strlen(key);
-
-	list_for_each_entry(ext, &opts.external, node) {
-		if (strncmp(ext->id, key, len))
-			continue;
-		if (ext->id[len] == ':')
-			return ext->id + len + 1;
-	}
-	return NULL;
-}
-
-int open_transport_socket()
-{
-	int sock;
+	if (!task_alive(current) || (fdt && fdt->pid != pid))
+		return 0;
 
 	sock = socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (sock < 0) {
 		pr_perror("Can't create socket");
 		return -1;
 	}
+
+	transport_name_gen(&saddr, &slen, pid);
+	if (bind(sock, (struct sockaddr *)&saddr, slen) < 0) {
+		pr_perror("Can't bind transport socket %s", saddr.sun_path + 1);
+		close(sock);
+		return -1;
+	}
+
 	if (install_service_fd(TRANSPORT_FD_OFF, sock) < 0) {
 		close(sock);
 		return -1;

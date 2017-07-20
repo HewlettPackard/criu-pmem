@@ -9,6 +9,8 @@
 #include <string.h>
 #include <netinet/in.h>
 
+#include "int.h"
+#include "bitops.h"
 #include "libnetlink.h"
 #include "sockets.h"
 #include "unix_diag.h"
@@ -20,6 +22,7 @@
 #include "sk-packet.h"
 #include "namespaces.h"
 #include "net.h"
+#include "xmalloc.h"
 #include "fs-magic.h"
 
 #ifndef SOCK_DIAG_BY_FAMILY
@@ -135,7 +138,7 @@ static inline void probe_diag(int nl, struct sock_diag_req *req, int expected_er
 	do_rtnl_req(nl, req, req->hdr.nlmsg_len, probe_recv_one, probe_err, &expected_err);
 }
 
-void preload_socket_modules()
+void preload_socket_modules(void)
 {
 	int nl;
 	struct sock_diag_req req;
@@ -642,7 +645,10 @@ int collect_sockets(struct ns_id *ns)
 	req.r.i.sdiag_protocol	= IPPROTO_TCP;
 	req.r.i.idiag_ext	= 0;
 	/* Only listening and established sockets supported yet */
-	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED);
+	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED) |
+					(1 << TCP_FIN_WAIT1) | (1 << TCP_FIN_WAIT2) |
+					(1 << TCP_CLOSE_WAIT) | (1 << TCP_LAST_ACK) |
+					(1 << TCP_CLOSING) | (1 << TCP_SYN_SENT);
 	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;
@@ -670,7 +676,10 @@ int collect_sockets(struct ns_id *ns)
 	req.r.i.sdiag_protocol	= IPPROTO_TCP;
 	req.r.i.idiag_ext	= 0;
 	/* Only listening sockets supported yet */
-	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED);
+	req.r.i.idiag_states	= (1 << TCP_LISTEN) | (1 << TCP_ESTABLISHED) |
+					(1 << TCP_FIN_WAIT1) | (1 << TCP_FIN_WAIT2) |
+					(1 << TCP_CLOSE_WAIT) | (1 << TCP_LAST_ACK) |
+					(1 << TCP_CLOSING) | (1 << TCP_SYN_SENT);
 	tmp = do_collect_req(nl, &req, sizeof(req), inet_receive_one, &req.r.i);
 	if (tmp)
 		err = tmp;

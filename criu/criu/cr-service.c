@@ -15,10 +15,12 @@
 #include <arpa/inet.h>
 #include <sched.h>
 
+#include "version.h"
 #include "crtools.h"
 #include "cr_options.h"
+#include "external.h"
 #include "util.h"
-#include "log.h"
+#include "criu-log.h"
 #include "cpu.h"
 #include "files.h"
 #include "pstree.h"
@@ -27,6 +29,7 @@
 #include "page-xfer.h"
 #include "net.h"
 #include "mount.h"
+#include "filesystems.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "action-scripts.h"
@@ -34,6 +37,9 @@
 #include "irmap.h"
 #include "kerndat.h"
 #include "proc_parse.h"
+#include <sys/un.h>
+#include <sys/socket.h>
+#include "common/scm.h"
 
 #include "setproctitle.h"
 
@@ -82,10 +88,10 @@ err:
 	return -1;
 }
 
-static int send_criu_msg(int socket_fd, CriuResp *msg)
+static int send_criu_msg_with_fd(int socket_fd, CriuResp *msg, int fd)
 {
 	unsigned char *buf;
-	int len;
+	int len, ret;
 
 	len = criu_resp__get_packed_size(msg);
 
@@ -98,7 +104,11 @@ static int send_criu_msg(int socket_fd, CriuResp *msg)
 		goto err;
 	}
 
-	if (write(socket_fd, buf, len)  == -1) {
+	if (fd >= 0) {
+		ret = send_fds(socket_fd, NULL, 0, &fd, 1, buf, len);
+	} else
+		ret = write(socket_fd, buf, len);
+	if (ret < 0) {
 		pr_perror("Can't send response");
 		goto err;
 	}
@@ -108,6 +118,11 @@ static int send_criu_msg(int socket_fd, CriuResp *msg)
 err:
 	xfree(buf);
 	return -1;
+}
+
+static int send_criu_msg(int socket_fd, CriuResp *msg)
+{
+	return send_criu_msg_with_fd(socket_fd, msg, -1);
 }
 
 static void set_resp_err(CriuResp *resp)
@@ -172,7 +187,7 @@ int send_criu_restore_resp(int socket_fd, bool success, int pid)
 	return send_criu_msg(socket_fd, &msg);
 }
 
-int send_criu_rpc_script(enum script_actions act, char *name, int fd)
+int send_criu_rpc_script(enum script_actions act, char *name, int sk, int fd)
 {
 	int ret;
 	CriuResp msg = CRIU_RESP__INIT;
@@ -193,17 +208,17 @@ int send_criu_rpc_script(enum script_actions act, char *name, int fd)
 		 * checking this.
 		 */
 		cn.has_pid = true;
-		cn.pid = root_item->pid.real;
+		cn.pid = root_item->pid->real;
 		break;
 	default:
 		break;
 	}
 
-	ret = send_criu_msg(fd, &msg);
+	ret = send_criu_msg_with_fd(sk, &msg, fd);
 	if (ret < 0)
 		return ret;
 
-	ret = recv_criu_msg(fd, &req);
+	ret = recv_criu_msg(sk, &req);
 	if (ret < 0)
 		return ret;
 
@@ -225,6 +240,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	socklen_t ids_len = sizeof(struct ucred);
 	char images_dir_path[PATH_MAX];
 	char work_dir_path[PATH_MAX];
+	char status_fd[PATH_MAX];
 	int i;
 
 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
@@ -302,7 +318,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_ext_unix_sk) {
 		opts.ext_unix_sk = req->ext_unix_sk;
 		for (i = 0; i < req->n_unix_sk_ino; i++) {
-			if (unix_sk_id_add(req->unix_sk_ino[i]->inode) < 0)
+			if (unix_sk_id_add((unsigned int)req->unix_sk_ino[i]->inode) < 0)
 				goto err;
 		}
 	}
@@ -324,6 +340,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->has_tcp_skip_in_flight)
 		opts.tcp_skip_in_flight = req->tcp_skip_in_flight;
+
+	if (req->has_weak_sysctls)
+		opts.weak_sysctls = req->weak_sysctls;
 
 	if (req->has_evasive_devices)
 		opts.evasive_devices = req->evasive_devices;
@@ -432,7 +451,7 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		case CRIU_CG_MODE__IGNORE:
 			mode = CG_MODE_IGNORE;
 			break;
-		case CRIU_CG_MODE__NONE:
+		case CRIU_CG_MODE__CG_NONE:
 			mode = CG_MODE_NONE;
 			break;
 		case CRIU_CG_MODE__PROPS:
@@ -499,6 +518,16 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 	}
 
+	if (req->has_status_fd) {
+		sprintf(status_fd, "/proc/%d/fd/%d", ids.pid, req->status_fd);
+		opts.status_fd = open(status_fd, O_WRONLY);
+		if (opts.status_fd < 0)
+			goto err;
+	}
+
+	if (req->orphan_pts_master)
+		opts.orphan_pts_master = true;
+
 	if (check_namespace_opts())
 		goto err;
 
@@ -563,7 +592,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 	success = true;
 exit:
 	if (send_criu_restore_resp(sk, success,
-				   root_item ? root_item->pid.real : -1) == -1) {
+				   root_item ? root_item->pid->real : -1) == -1) {
 		pr_perror("Can't send response");
 		success = false;
 	}
@@ -700,7 +729,7 @@ static int start_page_server_req(int sk, CriuOpts *req)
 		pr_debug("Starting page server\n");
 
 		pid = cr_page_server(true, start_pipe[1]);
-		if (pid <= 0)
+		if (pid < 0)
 			goto out_ch;
 
 		info.pid = pid;
@@ -771,8 +800,43 @@ static int chk_keepopen_req(CriuReq *msg)
 		return 0;
 	else if (msg->type == CRIU_REQ_TYPE__FEATURE_CHECK)
 		return 0;
+	else if (msg->type == CRIU_REQ_TYPE__VERSION)
+		return 0;
 
 	return -1;
+}
+
+/*
+ * Return the version information, depending on the information
+ * available in version.h
+ */
+static int handle_version(int sk, CriuReq * msg)
+{
+	CriuResp resp = CRIU_RESP__INIT;
+	CriuVersion version = CRIU_VERSION__INIT;
+
+	/* This assumes we will always have a major and minor version */
+	version.major = CRIU_VERSION_MAJOR;
+	version.minor = CRIU_VERSION_MINOR;
+	if (strcmp(CRIU_GITID, "0")) {
+		version.gitid = CRIU_GITID;
+	}
+#ifdef CRIU_VERSION_SUBLEVEL
+	version.has_sublevel = 1;
+	version.sublevel = CRIU_VERSION_SUBLEVEL;
+#endif
+#ifdef CRIU_VERSION_EXTRA
+	version.has_extra = 1;
+	version.extra = CRIU_VERSION_EXTRA;
+#endif
+#ifdef CRIU_VERSION_NAME
+	/* This is not actually exported in version.h */
+	version.name = CRIU_VERSION_NAME;
+#endif
+	resp.type = msg->type;
+	resp.success = true;
+	resp.version = &version;
+	return send_criu_msg(sk, &resp);
 }
 
 /*
@@ -824,16 +888,13 @@ static int handle_feature_check(int sk, CriuReq * msg)
 	if (pid == 0) {
 		int ret = 1;
 
-		if (setup_opts_from_req(sk, msg->opts))
-			goto cout;
-
-		setproctitle("feature-check --rpc -D %s", images_dir);
+		setproctitle("feature-check --rpc");
 
 		kerndat_get_dirty_track();
 
 		if (kdat.has_dirty_track)
 			ret = 0;
-cout:
+
 		exit(ret);
 	}
 
@@ -943,6 +1004,9 @@ more:
 		break;
 	case CRIU_REQ_TYPE__FEATURE_CHECK:
 		ret = handle_feature_check(sk, msg);
+		break;
+	case CRIU_REQ_TYPE__VERSION:
+		ret = handle_version(sk, msg);
 		break;
 
 	default:

@@ -19,7 +19,9 @@ REQ-DEB-PKG-NAMES	+= libcap-dev
 
 REQ-DEB-PKG-TEST-NAMES  += libaio-dev
 
-export LIBS		:= -lrt -lpthread -lprotobuf-c -ldl -lnl-3
+#REQ-DEB-PKG-NAMES       += libpmem
+
+export LIBS		+= -lrt -lpthread -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet #-lpmem
 
 check-packages-failed:
 	$(warning Can not find some of the required libraries)

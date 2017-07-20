@@ -15,10 +15,10 @@
 
 struct netlink_sk_desc {
 	struct socket_desc	sd;
-	u32                     portid;
+	u32			portid;
 	u32			*groups;
 	u32			gsize;
-	u32                     dst_portid;
+	u32			dst_portid;
 	u32			dst_group;
 	u8			state;
 	u8			protocol;
@@ -155,7 +155,7 @@ struct netlink_sock_info {
 	struct file_desc d;
 };
 
-static int open_netlink_sk(struct file_desc *d)
+static int open_netlink_sk(struct file_desc *d, int *new_fd)
 {
 	struct netlink_sock_info *nsi;
 	NetlinkSkEntry *nse;
@@ -206,7 +206,8 @@ static int open_netlink_sk(struct file_desc *d)
 	if (restore_socket_opts(sk, nse->opts))
 		goto err;
 
-	return sk;
+	*new_fd = sk;
+	return 0;
 err:
 	close(sk);
 	return -1;

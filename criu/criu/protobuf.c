@@ -10,8 +10,7 @@
 
 #include "image.h"
 #include "servicefd.h"
-#include "compiler.h"
-#include "asm/types.h"
+#include "common/compiler.h"
 #include "log.h"
 #include "rst-malloc.h"
 #include "string.h"
@@ -19,6 +18,7 @@
 #include "cr_options.h"
 #include "bfd.h"
 #include "protobuf.h"
+#include "util.h"
 
 /*
  * To speed up reading of packed objects

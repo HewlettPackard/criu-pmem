@@ -22,26 +22,26 @@
 
 #include <sys/fanotify.h>
 
-#include "compiler.h"
-#include "asm/types.h"
+#include "common/compiler.h"
 #include "imgset.h"
 #include "fsnotify.h"
 #include "fdinfo.h"
 #include "mount.h"
+#include "filesystems.h"
 #include "image.h"
 #include "util.h"
 #include "files.h"
 #include "files-reg.h"
 #include "file-ids.h"
-#include "log.h"
-#include "list.h"
-#include "lock.h"
+#include "criu-log.h"
+#include "common/list.h"
+#include "common/lock.h"
 #include "irmap.h"
 #include "cr_options.h"
 #include "namespaces.h"
 #include "pstree.h"
 #include "fault-injection.h"
-#include "syscall-codes.h"
+#include <compel/plugins/std/syscall-codes.h>
 
 #include "protobuf.h"
 #include "images/fsnotify.pb-c.h"
@@ -132,6 +132,8 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 
 		if (m->s_dev != s_dev)
 			continue;
+		if (!mnt_is_dir(m))
+			continue;
 
 		mntfd = __open_mountpoint(m, -1);
 		pr_debug("\t\tTrying via mntid %d root %s ns_mountpoint @%s (%d)\n",
@@ -178,9 +180,10 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 				path = xstrdup(buf);
 				if (path == NULL)
 					goto err;
-
-				f_handle->has_mnt_id = true;
-				f_handle->mnt_id = m->mnt_id;
+				if (root_ns_mask & CLONE_NEWNS) {
+					f_handle->has_mnt_id = true;
+					f_handle->mnt_id = m->mnt_id;
+				}
 				return path;
 			}
 		} else
@@ -423,6 +426,8 @@ static int dump_fanotify_entry(union fdinfo_entries *e, void *arg)
 			pr_err("Can't find mnt_id 0x%x\n", fme->me->mnt_id);
 			goto out;
 		}
+		if (!(root_ns_mask & CLONE_NEWNS))
+			fme->me->path = m->mountpoint + 1;
 		fme->s_dev = m->s_dev;
 
 		pr_info("mark: s_dev %#08x mnt_id  %#08x mask %#08x\n",
@@ -527,7 +532,6 @@ static char *get_mark_path(const char *who, struct file_remap *remap,
 		char *path = ".";
 		uint32_t mnt_id = f_handle->has_mnt_id ? f_handle->mnt_id : -1;
 
-
 		/* irmap cache is collected in the root namespaces. */
 		mntns_root = mntns_get_root_by_mnt_id(mnt_id);
 
@@ -605,9 +609,6 @@ static int restore_one_inotify(int inotify_fd, struct fsnotify_mark_info *info)
 	}
 
 err:
-	if (info->remap)
-		remap_put(info->remap);
-
 	close_safe(&target);
 	return ret;
 }
@@ -622,18 +623,24 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 	if (fme->type == MARK_TYPE__MOUNT) {
 		struct mount_info *m;
 		int mntns_root;
+		char *p = fme->me->path;
+		struct ns_id *nsid = NULL;
 
-		m = lookup_mnt_id(fme->me->mnt_id);
-		if (!m) {
-			pr_err("Can't find mount mnt_id 0x%x\n", fme->me->mnt_id);
-			return -1;
+		if (root_ns_mask & CLONE_NEWNS) {
+			m = lookup_mnt_id(fme->me->mnt_id);
+			if (!m) {
+				pr_err("Can't find mount mnt_id 0x%x\n", fme->me->mnt_id);
+				return -1;
+			}
+			nsid = m->nsid;
+			p = m->ns_mountpoint;
 		}
 
-		mntns_root = mntns_get_root_fd(m->nsid);
+		mntns_root = mntns_get_root_fd(nsid);
 
-		target = openat(mntns_root, m->ns_mountpoint, O_PATH);
+		target = openat(mntns_root, p, O_PATH);
 		if (target == -1) {
-			pr_perror("Unable to open %s", m->ns_mountpoint);
+			pr_perror("Unable to open %s", p);
 			goto err;
 		}
 
@@ -672,15 +679,12 @@ static int restore_one_fanotify(int fd, struct fsnotify_mark_info *mark)
 		}
 	}
 
-	if (mark->remap)
-		remap_put(mark->remap);
-
 err:
 	close_safe(&target);
 	return ret;
 }
 
-static int open_inotify_fd(struct file_desc *d)
+static int open_inotify_fd(struct file_desc *d, int *new_fd)
 {
 	struct fsnotify_file_info *info;
 	struct fsnotify_mark_info *wd_info;
@@ -705,10 +709,11 @@ static int open_inotify_fd(struct file_desc *d)
 	if (restore_fown(tmp, info->ife->fown))
 		close_safe(&tmp);
 
-	return tmp;
+	*new_fd = tmp;
+	return 0;
 }
 
-static int open_fanotify_fd(struct file_desc *d)
+static int open_fanotify_fd(struct file_desc *d, int *new_fd)
 {
 	struct fsnotify_file_info *info;
 	struct fsnotify_mark_info *mark;
@@ -740,7 +745,8 @@ static int open_fanotify_fd(struct file_desc *d)
 	if (restore_fown(ret, info->ffe->fown))
 		close_safe(&ret);
 
-	return ret;
+	*new_fd = ret;
+	return 0;
 }
 
 static struct file_desc_ops inotify_desc_ops = {

@@ -1,6 +1,3 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include "zdtmtst.h"
 
 #ifdef ZDTM_IPV6
@@ -69,7 +66,7 @@ int main(int argc, char **argv)
 	unshare(CLONE_NEWNET);
 	if (system("ip link set up dev lo"))
 		return 1;
-	if (system("iptables -A INPUT -i lo -p tcp -m state --state NEW,ESTABLISHED -j ACCEPT"))
+	if (system("iptables -w -A INPUT -i lo -p tcp -m state --state NEW,ESTABLISHED -j ACCEPT"))
 		return 1;
 	system("iptables -A INPUT -j DROP");
 #endif

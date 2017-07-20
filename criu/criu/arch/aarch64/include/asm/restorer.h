@@ -7,45 +7,7 @@
 #include "asm/types.h"
 #include "images/core.pb-c.h"
 
-/* Copied from the kernel header arch/arm64/include/uapi/asm/sigcontext.h */
-
-#define FPSIMD_MAGIC    0x46508001
-
-typedef struct fpsimd_context fpu_state_t;
-
-
-struct aux_context {
-	struct fpsimd_context fpsimd;
-	/* additional context to be added before "end" */
-	struct _aarch64_ctx end;
-};
-
-
-// XXX: the idetifier rt_sigcontext is expected to be struct by the CRIU code
-#define rt_sigcontext sigcontext
-
-
-#include "sigframe.h"
-
-
-/* Copied from the kernel source arch/arm64/kernel/signal.c */
-
-struct rt_sigframe {
-	siginfo_t info;
-	struct ucontext uc;
-	u64 fp;
-	u64 lr;
-};
-
-
-#define ARCH_RT_SIGRETURN(new_sp)						\
-	asm volatile(								\
-			"mov sp, %0					\n"	\
-			"mov x8, #"__stringify(__NR_rt_sigreturn)"	\n"	\
-			"svc #0						\n"	\
-			:							\
-			: "r"(new_sp)						\
-			: "sp", "x8", "memory")
+#include <compel/asm/sigframe.h>
 
 #define RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid,		\
 			     thread_args, clone_restore_fn)			\
@@ -90,38 +52,25 @@ struct rt_sigframe {
 			: "sp", "x0", "memory")
 
 
-#define RT_SIGFRAME_UC(rt_sigframe) (&rt_sigframe->uc)
-#define RT_SIGFRAME_REGIP(rt_sigframe) ((long unsigned int)(rt_sigframe)->uc.uc_mcontext.pc)
-#define RT_SIGFRAME_HAS_FPU(rt_sigframe) (1)
-#define RT_SIGFRAME_AUX_CONTEXT(rt_sigframe)				\
-	((struct aux_context*)&(rt_sigframe)->uc.uc_mcontext.__reserved)
-#define RT_SIGFRAME_FPU(rt_sigframe)					\
-	(&RT_SIGFRAME_AUX_CONTEXT(rt_sigframe)->fpsimd)
-#define RT_SIGFRAME_OFFSET(rt_sigframe) 0
-
+#define kdat_compatible_cr()			0
 
 int restore_gpregs(struct rt_sigframe *f, UserAarch64RegsEntry *r);
 int restore_nonsigframe_gpregs(UserAarch64RegsEntry *r);
-
-static inline int sigreturn_prep_fpu_frame(struct rt_sigframe *sigframe,
-		struct rt_sigframe *rsigframe)
-{
-	return 0;
-}
 
 static inline void restore_tls(tls_t *ptls)
 {
 	asm("msr tpidr_el0, %0" : : "r" (*ptls));
 }
 
-static inline int ptrace_set_breakpoint(pid_t pid, void *addr)
+static inline void *alloc_compat_syscall_stack(void) { return NULL; }
+static inline void free_compat_syscall_stack(void *stack32) { }
+static inline int arch_compat_rt_sigaction(void *stack, int sig, void *act)
 {
-	return 0;
+	return -1;
 }
-
-static inline int ptrace_flush_breakpoints(pid_t pid)
+static inline int set_compat_robust_list(uint32_t head_ptr, uint32_t len)
 {
-	return 0;
+	return -1;
 }
 
 #endif

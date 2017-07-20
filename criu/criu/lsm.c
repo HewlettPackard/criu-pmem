@@ -9,12 +9,11 @@
 #include "pstree.h"
 #include "util.h"
 #include "cr_options.h"
+#include "lsm.h"
 
 #include "protobuf.h"
 #include "images/inventory.pb-c.h"
 #include "images/creds.pb-c.h"
-
-#undef CONFIG_HAS_SELINUX
 
 #ifdef CONFIG_HAS_SELINUX
 #include <selinux/selinux.h>
@@ -112,13 +111,13 @@ void kerndat_lsm(void)
 {
 	/* On restore, if someone passes --lsm-profile, we might end up doing
 	 * detection twice, once during flag parsing and once for
-	 * kerndat_init_rst(). Let's detect when we've already done detection
+	 * kerndat_init(). Let's detect when we've already done detection
 	 * and not do it again.
 	 */
 	if (name)
 		return;
 
-	if (access("/sys/kernel/security/apparmor", F_OK) == 0) {
+	if (access(AA_SECURITYFS_PATH, F_OK) == 0) {
 		get_label = apparmor_get_label;
 		lsmtype = LSMTYPE__APPARMOR;
 		name = "apparmor";
@@ -193,7 +192,7 @@ int render_lsm_profile(char *profile, char **val)
 	switch (lsmtype) {
 	case LSMTYPE__APPARMOR:
 		if (strcmp(profile, "unconfined") != 0 && asprintf(val, "changeprofile %s", profile) < 0) {
-			pr_err("allocating lsm profile failed");
+			pr_err("allocating lsm profile failed\n");
 			*val = NULL;
 			return -1;
 		}
@@ -220,7 +219,7 @@ int parse_lsm_arg(char *arg)
 
 	aux = strchr(arg, ':');
 	if (aux == NULL) {
-		pr_err("invalid argument %s for --lsm-profile", arg);
+		pr_err("invalid argument %s for --lsm-profile\n", arg);
 		return -1;
 	}
 

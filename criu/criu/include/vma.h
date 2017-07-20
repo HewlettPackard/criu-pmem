@@ -1,9 +1,8 @@
 #ifndef __CR_VMA_H__
 #define __CR_VMA_H__
 
-#include "asm/types.h"
 #include "image.h"
-#include "list.h"
+#include "common/list.h"
 
 #include "images/vma.pb-c.h"
 
@@ -14,6 +13,7 @@ struct vm_area_list {
 	unsigned long		priv_size; /* nr of pages in private VMAs */
 	unsigned long		priv_longest; /* nr of pages in longest private VMA */
 	unsigned long		shared_longest; /* nr of pages in longest shared VMA */
+	int			fd;
 };
 
 #define VM_AREA_LIST(name)	struct vm_area_list name = { .h = LIST_HEAD_INIT(name.h), .nr = 0, }
@@ -35,17 +35,7 @@ struct vma_area {
 
 	union {
 		struct /* for dump */ {
-			union {
-				/*
-				 * These two cannot be assigned at once.
-				 * The file_fd is an fd for a regular file and
-				 * the socket_id is the inode number of the
-				 * mapped (PF_PACKET) socket.
-				 *
-				 * The aio_nr_req is only for aio rings.
-				 */
-				int	vm_socket_id;
-			};
+			int		vm_socket_id;
 
 			char		*aufs_rpath;	/* path from aufs root */
 			char		*aufs_fpath;	/* full path from global root */
@@ -73,8 +63,7 @@ struct vma_area {
 typedef int (*dump_filemap_t)(struct vma_area *vma_area, int fd);
 
 extern struct vma_area *alloc_vma_area(void);
-extern int collect_mappings(pid_t pid,
-		struct vm_area_list *vma_area_list, dump_filemap_t cb);
+//extern int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t cb);
 extern void free_mappings(struct vm_area_list *vma_area_list);
 
 extern int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t cb);
@@ -113,6 +102,11 @@ static inline bool vma_area_is_private(struct vma_area *vma,
 				       unsigned long task_size)
 {
 	return vma_entry_is_private(vma->e, task_size);
+}
+
+static inline struct vma_area *vma_next(struct vma_area *vma)
+{
+	return list_entry(vma->list.next, struct vma_area, list);
 }
 
 #endif /* __CR_VMA_H__ */

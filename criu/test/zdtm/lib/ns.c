@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,7 +6,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <sys/mount.h>
-#include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/param.h>
@@ -230,19 +229,6 @@ static int ns_exec(void *_arg)
 	return -1;
 }
 
-static void show_ps(void)
-{
-	int pid;
-
-	pid = fork();
-	if (pid == 0) {
-		execl("/bin/ps", "ps", "axf", "-o", "pid,sid,comm", NULL);
-		fprintf(stderr, "Unable to execute ps: %m\n");
-		exit(1);
-	} else if (pid > 0)
-		waitpid(pid, NULL, 0);
-}
-
 int ns_init(int argc, char **argv)
 {
 	struct sigaction sa = {
@@ -293,8 +279,6 @@ int ns_init(int argc, char **argv)
 	else if (ret)
 		fprintf(stderr, "The test returned non-zero code %d\n", ret);
 
-	show_ps();
-
 	if (reap && sigaction(SIGCHLD, &sa, NULL)) {
 		fprintf(stderr, "Can't set SIGCHLD handler: %m\n");
 		exit(1);
@@ -323,8 +307,6 @@ int ns_init(int argc, char **argv)
 	/* suspend/resume */
 	test_waitsig();
 
-	show_ps();
-
 	fd = open(pidfile, O_RDONLY);
 	if (fd == -1) {
 		fprintf(stderr, "open(%s) failed: %m\n", pidfile);
@@ -344,8 +326,22 @@ int ns_init(int argc, char **argv)
 
 	ret = 0;
 	if (reap) {
-		while (ret != -1)
-			ret = wait(NULL);
+		while (true) {
+			pid_t child;
+			ret = -1;
+
+			child = waitpid(-1, &ret, 0);
+			if (child < 0) {
+				fprintf(stderr, "Unable to wait a test process: %m");
+				exit(1);
+			}
+			if (child == pid) {
+				fprintf(stderr, "The test returned 0x%x", ret);
+				exit(!(ret == 0));
+			}
+			if (ret)
+				fprintf(stderr, "The %d process exited with 0x%x", child, ret);
+		}
 	} else {
 		waitpid(pid, NULL, 0);
 	}
@@ -362,6 +358,7 @@ void ns_create(int argc, char **argv)
 	int ret, status;
 	struct ns_exec_args args;
 	int flags;
+	char *pidf;
 
 	args.argc = argc;
 	args.argv = argv;
@@ -416,6 +413,14 @@ void ns_create(int argc, char **argv)
 	}
 	shutdown(args.status_pipe[0], SHUT_WR);
 
+	pidf = pidfile;
+	pidfile = malloc(strlen(pidfile) + 13);
+	sprintf(pidfile, "%s%s", pidf, INPROGRESS);
+	if (write_pidfile(pid)) {
+		fprintf(stderr, "Preparations fail\n");
+		exit(1);
+	}
+
 	status = 1;
 	ret = read(args.status_pipe[0], &status, sizeof(status));
 	if (ret != sizeof(status) || status) {
@@ -427,6 +432,9 @@ void ns_create(int argc, char **argv)
 		fprintf(stderr, "Unexpected message from test\n");
 		exit(1);
 	}
+
+	unlink(pidfile);
+	pidfile = pidf;
 
 	if (write_pidfile(pid))
 		exit(1);

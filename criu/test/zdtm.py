@@ -1,5 +1,5 @@
 #!/usr/bin/env python2
-# vim: noet
+# vim: noet ts=8 sw=8 sts=8
 import argparse
 import glob
 import os
@@ -60,6 +60,7 @@ def make_tests_root():
 		tests_root = (os.getpid(), tempfile.mkdtemp("", "criu-root-", "/tmp"))
 		atexit.register(clean_tests_root)
 	return tests_root[1]
+
 
 # Report generation
 
@@ -122,6 +123,7 @@ def check_core_files():
 		print_sep(i)
 
 	return True
+
 
 # Arch we run on
 arch = os.uname()[4]
@@ -246,8 +248,7 @@ class ns_flavor:
 
 	def fini(self):
 		if self.root_mounted:
-			subprocess.check_call(["mount", "--make-private", self.root])
-			subprocess.check_call(["umount", "-l", self.root])
+			subprocess.check_call(["./umount2", self.root])
 			self.root_mounted = False
 
 	@staticmethod
@@ -290,10 +291,10 @@ def encode_flav(f):
 
 
 def decode_flav(i):
-	i = i - 128
-	if i in flavors:
+	try:
 		return flavors.keys()[i - 128]
-	return "unknown"
+	except:
+		return "unknown"
 
 
 def tail(path):
@@ -375,6 +376,8 @@ class zdtm_test:
 
 		s = subprocess.Popen(s_args, env = env, cwd = root, close_fds = True,
 				preexec_fn = self.__freezer and self.__freezer.attach or None)
+		if act == "pid":
+			try_run_hook(self, ["--post-start"])
 		s.wait()
 
 		if self.__freezer:
@@ -510,6 +513,8 @@ class zdtm_test:
 
 	@staticmethod
 	def available():
+		if not os.access("umount2", os.X_OK):
+			subprocess.check_call(["make", "umount2"])
 		if not os.access("zdtm_ct", os.X_OK):
 			subprocess.check_call(["make", "zdtm_ct"])
 		if not os.access("zdtm/lib/libzdtmtst.a", os.F_OK):
@@ -670,12 +675,16 @@ join_ns_file = '/run/netns/zdtm_netns'
 
 class criu_cli:
 	@staticmethod
-	def run(action, args, fault = None, strace = [], preexec = None):
-		env = None
+	def run(action, args, fault = None, strace = [], preexec = None, nowait = False):
+		env = dict(os.environ, ASAN_OPTIONS = "log_path=asan.log:disable_coredump=0:detect_leaks=0")
+
 		if fault:
 			print "Forcing %s fault" % fault
-			env = dict(os.environ, CRIU_FAULT = fault)
+			env['CRIU_FAULT'] = fault
+
 		cr = subprocess.Popen(strace + [criu_bin, action] + args, env = env, preexec_fn = preexec)
+		if nowait:
+			return cr
 		return cr.wait()
 
 
@@ -710,40 +719,51 @@ class criu_rpc:
 			if arg == '--root':
 				criu.opts.root = args.pop(0)
 				continue
+			if arg == '--external':
+				criu.opts.external.append(args.pop(0))
+				continue
 
 			raise test_fail_exc('RPC for %s required' % arg)
 
 	@staticmethod
-	def run(action, args, fault = None, strace = [], preexec = None):
+	def run(action, args, fault = None, strace = [], preexec = None, nowait = False):
 		if fault:
 			raise test_fail_exc('RPC and FAULT not supported')
 		if strace:
 			raise test_fail_exc('RPC and SAT not supported')
 		if preexec:
 			raise test_fail_exc('RPC and PREEXEC not supported')
+		if nowait:
+			raise test_fail_exc("RPC and status-fd not supported")
 
 		ctx = {}  # Object used to keep info untill action is done
 		criu = crpc.criu()
 		criu.use_binary(criu_bin)
 		criu_rpc.__set_opts(criu, args, ctx)
 
-		if action == 'dump':
-			criu.dump()
-		elif action == 'restore':
-			if 'rd' not in ctx:
-				raise test_fail_exc('RPC Non-detached restore is impossible')
+		try:
+			if action == 'dump':
+				criu.dump()
+			elif action == 'restore':
+				if 'rd' not in ctx:
+					raise test_fail_exc('RPC Non-detached restore is impossible')
 
-			res = criu.restore()
-			pidf = ctx.get('pidf')
-			if pidf:
-				open(pidf, 'w').write('%d\n' % res.pid)
+				res = criu.restore()
+				pidf = ctx.get('pidf')
+				if pidf:
+					open(pidf, 'w').write('%d\n' % res.pid)
+			else:
+				raise test_fail_exc('RPC for %s required' % action)
+		except crpc.CRIUExceptionExternal:
+			print "Fail"
+			ret = -1
 		else:
-			raise test_fail_exc('RPC for %s required' % action)
+			ret = 0
 
 		imgd = ctx.get('imgd')
 		if imgd:
 			os.close(imgd)
-		return 0
+		return ret
 
 
 class criu:
@@ -755,13 +775,17 @@ class criu:
 		self.__page_server = (opts['page_server'] and True or False)
 		self.__restore_sibling = (opts['sibling'] and True or False)
 		self.__join_ns = (opts['join_ns'] and True or False)
+		self.__empty_ns = (opts['empty_ns'] and True or False)
 		self.__fault = (opts['fault'])
 		self.__script = opts['script']
 		self.__sat = (opts['sat'] and True or False)
 		self.__dedup = (opts['dedup'] and True or False)
+		self.__mdedup = (opts['noauto_dedup'] and True or False)
 		self.__user = (opts['user'] and True or False)
 		self.__leave_stopped = (opts['stop'] and True or False)
 		self.__criu = (opts['rpc'] and criu_rpc or criu_cli)
+		self.__lazy_pages_p = None
+		self.__page_server_p = None
 
 	def logs(self):
 		return self.__dump_path
@@ -793,7 +817,7 @@ class criu:
 		os.setresgid(58467, 58467, 58467)
 		os.setresuid(18943, 18943, 18943)
 
-	def __criu_act(self, action, opts, log = None):
+	def __criu_act(self, action, opts = [], log = None, nowait = False):
 		if not log:
 			log = action + ".log"
 
@@ -822,7 +846,23 @@ class criu:
 
 		__ddir = self.__ddir()
 
-		ret = self.__criu.run(action, s_args, self.__fault, strace, preexec)
+		status_fds = None
+		if nowait:
+			status_fds = os.pipe()
+			s_args += ["--status-fd", str(status_fds[1])]
+
+		ns_last_pid = open("/proc/sys/kernel/ns_last_pid").read()
+
+		ret = self.__criu.run(action, s_args, self.__fault, strace, preexec, nowait)
+
+		if nowait:
+			os.close(status_fds[1])
+			if os.read(status_fds[0], 1) != '\0':
+				ret = ret.wait()
+				raise test_fail_exc("criu %s exited with %s" % (action, ret))
+			os.close(status_fds[0])
+			return ret
+
 		grep_errors(os.path.join(__ddir, log))
 		if ret != 0:
 			if self.__fault and int(self.__fault) < 128:
@@ -835,6 +875,9 @@ class criu:
 				else:
 					# on restore we move only a log file, because we need images
 					os.rename(os.path.join(__ddir, log), os.path.join(__ddir, log + ".fail"))
+				# restore ns_last_pid to avoid a case when criu gets
+				# PID of one of restored processes.
+				open("/proc/sys/kernel/ns_last_pid", "w+").write(ns_last_pid)
 				# try again without faults
 				print "Run criu " + action
 				ret = self.__criu.run(action, s_args, False, strace, preexec)
@@ -859,11 +902,11 @@ class criu:
 		if self.__page_server:
 			print "Adding page server"
 
-			ps_opts = ["--port", "12345", "--daemon", "--pidfile", "ps.pid"]
+			ps_opts = ["--port", "12345"]
 			if self.__dedup:
 				ps_opts += ["--auto-dedup"]
 
-			self.__criu_act("page-server", opts = ps_opts)
+			self.__page_server_p = self.__criu_act("page-server", opts = ps_opts, nowait = True)
 			a_opts += ["--page-server", "--address", "127.0.0.1", "--port", "12345"]
 
 		a_opts += self.__test.getdopts()
@@ -875,20 +918,27 @@ class criu:
 
 		criu_dir = os.path.dirname(os.getcwd())
 		if os.getenv("GCOV"):
-			a_opts.append("--ext-mount-map")
-			a_opts.append("%s:zdtm" % criu_dir)
+			a_opts.append('--external')
+			a_opts.append('mnt[%s]:zdtm' % criu_dir)
 
 		if self.__leave_stopped:
 			a_opts += ['--leave-stopped']
+		if self.__empty_ns:
+			a_opts += ['--empty-ns', 'net']
 
 		self.__criu_act(action, opts = a_opts + opts)
+		if self.__mdedup and self.__iter > 1:
+			self.__criu_act("dedup", opts = [])
 
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
 			pstree_signal(self.__test.getpid(), signal.SIGKILL)
 
-		if self.__page_server:
-			wait_pid_die(int(rpidfile(self.__ddir() + "/ps.pid")), "page server")
+		if self.__page_server_p:
+			ret = self.__page_server_p.wait()
+			self.__page_server_p = None
+			if ret:
+				raise test_fail_exc("criu page-server exited with %d" % ret)
 
 	def restore(self):
 		r_opts = []
@@ -899,17 +949,32 @@ class criu:
 		if self.__join_ns:
 			r_opts.append("--join-ns")
 			r_opts.append("net:%s" % join_ns_file)
+		if self.__empty_ns:
+			r_opts += ['--empty-ns', 'net']
+			r_opts += ['--action-script', os.getcwd() + '/empty-netns-prep.sh']
 
 		self.__prev_dump_iter = None
 		criu_dir = os.path.dirname(os.getcwd())
 		if os.getenv("GCOV"):
-			r_opts.append("--ext-mount-map")
-			r_opts.append("zdtm:%s" % criu_dir)
+			r_opts.append('--external')
+			r_opts.append('mnt[zdtm]:%s' % criu_dir)
 
 		if self.__leave_stopped:
 			r_opts += ['--leave-stopped']
 
 		self.__criu_act("restore", opts = r_opts + ["--restore-detached"])
+
+		if self.__lazy_pages_p:
+			ret = self.__lazy_pages_p.wait()
+			self.__lazy_pages_p = None
+			if ret:
+				raise test_fail_exc("criu lazy-pages exited with %s" % ret)
+
+		if self.__page_server_p:
+			ret = self.__page_server_p.wait()
+			self.__page_server_p = None
+			if ret:
+				raise test_fail_exc("criu page-server exited with %s" % ret)
 
 		if self.__leave_stopped:
 			pstree_check_stopped(self.__test.getpid())
@@ -925,6 +990,16 @@ class criu:
 			print "CRIU binary not built"
 			sys.exit(1)
 
+	def kill(self):
+		if self.__lazy_pages_p:
+			self.__lazy_pages_p.terminate()
+			print "criu lazy-pages exited with %s" & self.wait()
+			self.__lazy_pages_p = None
+		if self.__page_server_p:
+			self.__page_server_p.terminate()
+			print "criu page-server exited with %s" & self.wait()
+			self.__page_server_p = None
+
 
 def try_run_hook(test, args):
 	hname = test.getname() + '.hook'
@@ -933,6 +1008,7 @@ def try_run_hook(test, args):
 		hook = subprocess.Popen([hname] + args)
 		if hook.wait() != 0:
 			raise test_fail_exc("hook " + " ".join(args))
+
 
 #
 # Step by step execution
@@ -981,14 +1057,20 @@ def cr(cr_api, test, opts):
 
 		sbs('pre-dump')
 
+		os.environ["ZDTM_TEST_PID"] = str(test.getpid())
 		if opts['norst']:
+			try_run_hook(test, ["--pre-dump"])
 			cr_api.dump("dump", opts = ["--leave-running"])
 		else:
+			try_run_hook(test, ["--pre-dump"])
 			cr_api.dump("dump")
 			test.gone()
 			sbs('pre-restore')
 			try_run_hook(test, ["--pre-restore"])
 			cr_api.restore()
+			os.environ["ZDTM_TEST_PID"] = str(test.getpid())
+                        os.environ["ZDTM_IMG_DIR"] = cr_api.logs()
+			try_run_hook(test, ["--post-restore"])
 			sbs('post-restore')
 
 		time.sleep(iters[1])
@@ -1258,6 +1340,8 @@ def do_run_test(tname, tdesc, flavs, opts):
 			print_sep("Test %s FAIL at %s" % (tname, e.step), '#')
 			t.print_output()
 			t.kill()
+			cr_api.kill()
+			try_run_hook(t, ["--clean"])
 			if cr_api.logs():
 				add_to_report(cr_api.logs(), tname.replace('/', '_') + "_" + f + "/images")
 			if opts['keep_img'] == 'never':
@@ -1282,6 +1366,8 @@ class launcher:
 		self.__subs = {}
 		self.__fail = False
 		self.__file_report = None
+		self.__failed = []
+		self.__nr_skip = 0
 		if self.__max > 1 and self.__total > 1:
 			self.__use_log = True
 		elif opts['report']:
@@ -1298,20 +1384,21 @@ class launcher:
 				att += 1
 
 			self.__file_report = open(reportname, 'a')
+			print >> self.__file_report, "TAP version 13"
 			print >> self.__file_report, "# Hardware architecture: " + arch
 			print >> self.__file_report, "# Timestamp: " + now.strftime("%Y-%m-%d %H:%M") + " (GMT+1)"
 			print >> self.__file_report, "# "
-			print >> self.__file_report, "TAP version 13"
 			print >> self.__file_report, "1.." + str(nr_tests)
 
-	def __show_progress(self):
+	def __show_progress(self, msg):
 		perc = self.__nr * 16 / self.__total
-		print "=== Run %d/%d %s" % (self.__nr, self.__total, '=' * perc + '-' * (16 - perc))
+		print "=== Run %d/%d %s %s" % (self.__nr, self.__total, '=' * perc + '-' * (16 - perc), msg)
 
 	def skip(self, name, reason):
 		print "Skipping %s (%s)" % (name, reason)
 		self.__nr += 1
 		self.__runtest += 1
+		self.__nr_skip += 1
 		if self.__file_report:
 			testline = "ok %d - %s # SKIP %s" % (self.__runtest, name, reason)
 			print >> self.__file_report, testline
@@ -1325,11 +1412,11 @@ class launcher:
 			self.wait_all()
 
 		self.__nr += 1
-		self.__show_progress()
+		self.__show_progress(name)
 
-		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop',
+		nd = ('nocr', 'norst', 'pre', 'iters', 'page_server', 'sibling', 'stop', 'empty_ns',
 				'fault', 'keep_img', 'report', 'snaps', 'sat', 'script', 'rpc',
-				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run')
+				'join_ns', 'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup')
 		arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
 		if self.__use_log:
@@ -1355,6 +1442,7 @@ class launcher:
 			if status != 0:
 				self.__fail = True
 				failed_flavor = decode_flav(os.WEXITSTATUS(status))
+				self.__failed.append([sub['name'], failed_flavor])
 				if self.__file_report:
 					testline = "not ok %d - %s # flavor %s" % (self.__runtest, sub['name'], failed_flavor)
 					details = {'output': open(sub['log']).read()}
@@ -1398,6 +1486,17 @@ class launcher:
 			self.__fail = True
 		if self.__file_report:
 			self.__file_report.close()
+
+		if opts['keep_going']:
+			if self.__fail:
+				print_sep("%d TEST(S) FAILED (TOTAL %d/SKIPPED %d)"
+						% (len(self.__failed), self.__total, self.__nr_skip), "#")
+				for failed in self.__failed:
+					print " * %s(%s)" % (failed[0], failed[1])
+			else:
+				print_sep("ALL TEST(S) PASSED (TOTAL %d/SKIPPED %d)"
+						% (self.__total, self.__nr_skip), "#")
+
 		if self.__fail:
 			print_sep("FAIL", "#")
 			sys.exit(1)
@@ -1424,7 +1523,7 @@ default_test = {}
 
 def get_test_desc(tname):
 	d_path = tname + '.desc'
-	if os.access(d_path, os.F_OK):
+	if os.access(d_path, os.F_OK) and os.path.getsize(d_path) > 0:
 		return eval(open(d_path).read())
 
 	return default_test
@@ -1447,15 +1546,33 @@ def print_sep(title, sep = "=", width = 80):
 	print (" " + title + " ").center(width, sep)
 
 
+def print_error(line):
+	line = line.rstrip()
+	print line
+	if line.endswith('>'):  # combine pie output
+		return True
+	return False
+
+
 def grep_errors(fname):
 	first = True
+	print_next = False
+	before = []
 	for l in open(fname):
+		before.append(l)
+		if len(before) > 5:
+			before.pop(0)
 		if "Error" in l:
 			if first:
 				print_fname(fname, 'log')
 				print_sep("grep Error", "-", 60)
 				first = False
-			print l,
+			for i in before:
+				print_next = print_error(i)
+			before = []
+		else:
+			if print_next:
+				print_next = print_error(l)
 	if not first:
 		print_sep("ERROR OVER", "-", 60)
 
@@ -1469,20 +1586,15 @@ def run_tests(opts):
 			print "Tracking memory is not available"
 			return
 
-	if opts['keep_going'] and (not opts['all']):
-		print "[WARNING] Option --keep-going is more useful with option --all."
-
 	if opts['all']:
 		torun = all_tests(opts)
 		run_all = True
 	elif opts['tests']:
 		r = re.compile(opts['tests'])
 		torun = filter(lambda x: r.match(x), all_tests(opts))
-		opts['keep_going'] = False
 		run_all = True
 	elif opts['test']:
 		torun = opts['test']
-		opts['keep_going'] = False
 		run_all = False
 	elif opts['from']:
 		if not os.access(opts['from'], os.R_OK):
@@ -1495,6 +1607,10 @@ def run_tests(opts):
 	else:
 		print "Specify test with -t <name> or -a"
 		return
+
+	if opts['keep_going'] and len(torun) < 2:
+		print "[WARNING] Option --keep-going is more useful when running multiple tests"
+		opts['keep_going'] = False
 
 	if opts['exclude']:
 		excl = re.compile(".*(" + "|".join(opts['exclude']) + ")")
@@ -1573,6 +1689,8 @@ def run_tests(opts):
 			# remove ns and uns flavor in join_ns
 			if opts['join_ns']:
 				run_flavs -= set(['ns', 'uns'])
+			if opts['empty_ns']:
+				run_flavs -= set(['h'])
 
 			if run_flavs:
 				l.run_test(t, tdesc, run_flavs)
@@ -1582,6 +1700,7 @@ def run_tests(opts):
 		l.finish()
 		if opts['join_ns']:
 			subprocess.Popen(["ip", "netns", "delete", "zdtm_netns"])
+
 
 sti_fmt = "%-40s%-10s%s"
 
@@ -1764,9 +1883,11 @@ rp.add_argument("-x", "--exclude", help = "Exclude tests from --all run", action
 
 rp.add_argument("--sibling", help = "Restore tests as siblings", action = 'store_true')
 rp.add_argument("--join-ns", help = "Restore tests and join existing namespace", action = 'store_true')
+rp.add_argument("--empty-ns", help = "Restore tests in empty net namespace", action = 'store_true')
 rp.add_argument("--pre", help = "Do some pre-dumps before dump (n[:pause])")
 rp.add_argument("--snaps", help = "Instead of pre-dumps do full dumps", action = 'store_true')
 rp.add_argument("--dedup", help = "Auto-deduplicate images on iterations", action = 'store_true')
+rp.add_argument("--noauto-dedup", help = "Manual deduplicate images on iterations", action = 'store_true')
 rp.add_argument("--nocr", help = "Do not CR anything, just check test works", action = 'store_true')
 rp.add_argument("--norst", help = "Don't restore tasks, leave them running after dump", action = 'store_true')
 rp.add_argument("--stop", help = "Check that --leave-stopped option stops ps tree.", action = 'store_true')

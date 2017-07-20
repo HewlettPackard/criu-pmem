@@ -35,16 +35,17 @@
 #include <sched.h>
 #include <ctype.h>
 
-#include "compiler.h"
-#include "asm/types.h"
-#include "list.h"
+#include "bitops.h"
+#include "page.h"
+#include "common/compiler.h"
+#include "common/list.h"
 #include "util.h"
 #include "rst-malloc.h"
 #include "image.h"
 #include "vma.h"
 #include "mem.h"
 #include "namespaces.h"
-#include "log.h"
+#include "criu-log.h"
 
 #include "cr_options.h"
 #include "servicefd.h"
@@ -326,6 +327,8 @@ inline int open_pid_proc(pid_t pid)
 	int fd;
 	int dfd;
 
+//	printf("open pid proc in utli.c\n");
+
 	fd = get_proc_fd(pid);
 	if (fd >= 0)
 		return fd;
@@ -379,6 +382,8 @@ int do_open_proc(pid_t pid, int flags, const char *fmt, ...)
 	vsnprintf(path, sizeof(path), fmt, args);
 	va_end(args);
 
+//	printf("do_open_proc: %s\n", path);
+
 	return openat(dirfd, path, flags);
 }
 
@@ -399,6 +404,10 @@ int init_service_fd(void)
 		return -1;
 	}
 
+
+
+	//printf("service_fd_rlim_cur:%d,  SERVICE_FD_MAX: %d\n", service_fd_rlim_cur , SERVICE_FD_MAX);
+
 	service_fd_rlim_cur = (int)rlimit.rlim_cur;
 	BUG_ON(service_fd_rlim_cur < SERVICE_FD_MAX);
 
@@ -407,6 +416,7 @@ int init_service_fd(void)
 
 static int __get_service_fd(enum sfd_type type, int service_fd_id)
 {
+//	printf("service_fd_rlim_cur: %d, type: %d, service_fd_id: %d\n", service_fd_rlim_cur, type, service_fd_id);
 	return service_fd_rlim_cur - type - SERVICE_FD_MAX * service_fd_id;
 }
 
@@ -480,9 +490,11 @@ int clone_service_fd(int id)
 		return 0;
 
 	for (i = SERVICE_FD_MIN + 1; i < SERVICE_FD_MAX; i++) {
-		int old = __get_service_fd(i, service_fd_id);
+		int old = get_service_fd(i);
 		int new = __get_service_fd(i, id);
 
+		if (old < 0)
+			continue;
 		ret = dup2(old, new);
 		if (ret == -1) {
 			if (errno == EBADF)
@@ -686,6 +698,21 @@ out:
 	return ret;
 }
 
+int close_status_fd(void)
+{
+	char c = 0;
+
+	if (opts.status_fd < 0)
+		return 0;
+
+	if (write(opts.status_fd, &c, 1) != 1) {
+		pr_perror("Unable to write into the status fd");
+		return -1;
+	}
+
+	return close_safe(&opts.status_fd);
+}
+
 int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 {
 	int pid;
@@ -709,8 +736,15 @@ int cr_daemon(int nochdir, int noclose, int *keep_fd, int close_fd)
 		if (close_fd != -1)
 			close(close_fd);
 
-		if (*keep_fd != -1)
-			*keep_fd = dup2(*keep_fd, 3);
+		if ((*keep_fd != -1) && (*keep_fd != 3)) {
+			fd = dup2(*keep_fd, 3);
+			if (fd < 0) {
+				pr_perror("Dup2 failed");
+				return -1;
+			}
+			close(*keep_fd);
+			*keep_fd = fd;
+		}
 
 		fd = open("/dev/null", O_RDWR);
 		if (fd < 0) {
@@ -764,7 +798,7 @@ int vaddr_to_pfn(unsigned long vaddr, u64 *pfn)
 	int fd, ret = -1;
 	off_t off;
 
-	fd = open_proc(getpid(), "pagemap");
+	fd = open_proc(PROC_SELF, "pagemap");
 	if (fd < 0)
 		return -1;
 
@@ -800,14 +834,14 @@ struct vma_area *alloc_vma_area(void)
 	return p;
 }
 
-int mkdirpat(int fd, const char *path)
+int mkdirpat(int fd, const char *path, int mode)
 {
 	size_t i;
 	char made_path[PATH_MAX], *pos;
 
 	if (strlen(path) >= PATH_MAX) {
 		pr_err("path %s is longer than PATH_MAX\n", path);
-		return -1;
+		return -ENOSPC;
 	}
 
 	strcpy(made_path, path);
@@ -820,9 +854,10 @@ int mkdirpat(int fd, const char *path)
 		pos = strchr(made_path + i, '/');
 		if (pos)
 			*pos = '\0';
-		if (mkdirat(fd, made_path, 0755) < 0 && errno != EEXIST) {
+		if (mkdirat(fd, made_path, mode) < 0 && errno != EEXIST) {
+			int ret = -errno;
 			pr_perror("couldn't mkdirpat directory %s", made_path);
-			return -1;
+			return ret;
 		}
 		if (pos) {
 			*pos = '/';
@@ -1142,6 +1177,9 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 			return ret;
 		}
 	}
+
+	if (close_status_fd())
+		return -1;
 
 	if (sk >= 0) {
 		ret = *ask = accept(sk, (struct sockaddr *)&caddr, &clen);

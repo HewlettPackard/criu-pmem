@@ -8,7 +8,7 @@ import "core-ppc64.proto";
 import "rlimit.proto";
 import "timer.proto";
 import "creds.proto";
-
+import "sa.proto";
 import "siginfo.proto";
 
 import "opts.proto";
@@ -23,7 +23,7 @@ enum seccomp_mode {
 };
 
 message task_core_entry {
-	required uint32			task_state	= 1;
+	required uint32			task_state	= 1 [(criu).dict = "gen"];
 	required uint32			exit_code	= 2;
 
 	required uint32			personality	= 3;
@@ -45,6 +45,7 @@ message task_core_entry {
 	optional uint32			loginuid	= 13;
 
 	optional int32			oom_score_adj	= 14;
+	repeated sa_entry		sigactions	= 15;
 }
 
 message task_kobj_ids_entry {

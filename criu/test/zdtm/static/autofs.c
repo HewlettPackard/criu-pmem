@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +32,7 @@ TEST_OPTION(dirname, string, "directory name", 1);
 #define INDIRECT_MNT_DIR		"mnt"
 
 int autofs_dev;
+task_waiter_t t;
 
 static char *xvstrcat(char *str, const char *fmt, va_list args)
 {
@@ -127,7 +126,7 @@ static int setup_direct(struct autofs_params *p)
 	}
 	p->fd = open(path, O_CREAT | O_EXCL, 0600);
 	if (p->fd < 0) {
-		pr_perror("%d: failed to open file %s\n", getpid(), path);
+		pr_perror("%d: failed to open file %s", getpid(), path);
 		return -errno;
 	}
 	if (fstat(p->fd, &p->fd_stat)) {
@@ -149,7 +148,7 @@ static int setup_indirect(struct autofs_params *p)
 	}
 	p->fd = open(path, O_CREAT | O_EXCL, 0600);
 	if (p->fd < 0) {
-		pr_perror("%d: failed to open file %s\n", getpid(), path);
+		pr_perror("%d: failed to open file %s", getpid(), path);
 		return -errno;
 	}
 	if (fstat(p->fd, &p->fd_stat)) {
@@ -221,18 +220,21 @@ static int check_fd(struct autofs_params *p)
 		ret++;
 	}
 	if (st.st_size != p->fd_stat.st_size) {
-		pr_err("%s: st_size differs: %ld != %ld\n", p->mountpoint,
-				st.st_size, p->fd_stat.st_size);
+		pr_err("%s: st_size differs: %lld != %lld\n", p->mountpoint,
+				(long long)st.st_size,
+				(long long)p->fd_stat.st_size);
 		ret++;
 	}
 	if (st.st_blksize != p->fd_stat.st_blksize) {
-		pr_err("%s: st_blksize differs %ld != %ld:\n", p->mountpoint,
-				st.st_blksize, p->fd_stat.st_blksize);
+		pr_err("%s: st_blksize differs %lld != %lld:\n", p->mountpoint,
+				(long long)st.st_blksize,
+				(long long)p->fd_stat.st_blksize);
 		ret++;
 	}
 	if (st.st_blocks != p->fd_stat.st_blocks) {
-		pr_err("%s: st_blocks differs: %ld != %ld\n", p->mountpoint,
-				st.st_blocks, p->fd_stat.st_blocks);
+		pr_err("%s: st_blocks differs: %lld != %lld\n", p->mountpoint,
+				(long long)st.st_blocks,
+				(long long)p->fd_stat.st_blocks);
 		ret++;
 	}
 
@@ -301,7 +303,7 @@ static int autofs_dev_open(void)
 
 	fd = open(AUTOFS_DEV, O_RDONLY);
 	if (fd == -1) {
-		pr_perror("failed to open /dev/autofs\n");
+		pr_perror("failed to open /dev/autofs");
 		return -errno;
 	}
 	return fd;
@@ -323,7 +325,7 @@ static int autofs_open_mount(int devid, const char *mountpoint)
 	strcpy(param->path, mountpoint);
 
 	if (ioctl(autofs_dev, AUTOFS_DEV_IOCTL_OPENMOUNT, param) < 0) {
-		pr_perror("failed to open autofs mount %s\n", mountpoint);
+		pr_perror("failed to open autofs mount %s", mountpoint);
 		return -errno;
 	}
 
@@ -564,15 +566,16 @@ static int automountd(struct autofs_params *p, int control_fd)
 
 	ret = 0;
 	if (write(control_fd, &ret, sizeof(ret)) != sizeof(ret)) {
-		pr_perror("failed to send result\n");
+		pr_perror("failed to send result");
 		goto err;
 	}
 	close(control_fd);
+	task_waiter_complete(&t, getpid());
 	return automountd_loop(pipes[0], autofs_path, p);
 
 err:
 	if (write(control_fd, &ret, sizeof(ret) != sizeof(ret))) {
-		pr_perror("failed to send result\n");
+		pr_perror("failed to send result");
 		return -errno;
 	}
 	return ret;
@@ -593,12 +596,13 @@ static int start_automounter(struct autofs_params *p)
 	pid = test_fork();
 	switch (pid) {
 		case -1:
-			pr_perror("failed to fork\n");
+			pr_perror("failed to fork");
 			return -1;
 		case 0:
 			close(control_fd[0]);
 			exit(automountd(p, control_fd[1]));
 	}
+	task_waiter_wait4(&t, pid);
 	p->pid = pid;
 
 	close(control_fd[1]);
@@ -638,7 +642,7 @@ static int reap_child(struct autofs_params *p)
 	}
 
 	if (WIFSIGNALED(status)) {
-		pr_perror("Kid was killed by %d\n", WTERMSIG(status));
+		pr_err("Child was killed by %d\n", WTERMSIG(status));
 		return -1;
 	}
 
@@ -679,7 +683,7 @@ static int setup_catatonic(struct autofs_params *p)
 
 	p->fd = open(path, O_CREAT | O_EXCL, 0600);
 	if (p->fd >= 0) {
-		pr_perror("%d: was able to open file %s on catatonic mount\n", getpid(), path);
+		pr_perror("%d: was able to open file %s on catatonic mount", getpid(), path);
 		return -EINVAL;
 	}
 	free(path);
@@ -876,6 +880,8 @@ int main(int argc, char **argv)
 	int ret = 0;
 
 	test_init(argc, argv);
+
+	task_waiter_init(&t);
 
 	if (mkdir(dirname, 0777) < 0) {
 		pr_perror("failed to create %s directory", dirname);

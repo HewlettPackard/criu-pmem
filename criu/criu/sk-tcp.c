@@ -1,6 +1,4 @@
 #include <netinet/tcp.h>
-#include <sys/ioctl.h>
-#include <linux/sockios.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -8,11 +6,11 @@
 #include <sched.h>
 #include <netinet/in.h>
 
-#include "cr_options.h"
+#include "../soccr/soccr.h"
+
 #include "util.h"
-#include "list.h"
+#include "common/list.h"
 #include "log.h"
-#include "asm/types.h"
 #include "files.h"
 #include "sockets.h"
 #include "sk-inet.h"
@@ -28,114 +26,14 @@
 #include "protobuf.h"
 #include "images/tcp-stream.pb-c.h"
 
-#ifndef SIOCOUTQNSD
-/* MAO - Define SIOCOUTQNSD ioctl if we don't have it */
-#define SIOCOUTQNSD     0x894B
-#endif
-
-#ifndef CONFIG_HAS_TCP_REPAIR_WINDOW
-struct tcp_repair_window {
-	u32   snd_wl1;
-	u32   snd_wnd;
-	u32   max_window;
-
-	u32   rcv_wnd;
-	u32   rcv_wup;
-};
-#endif
-
-#ifndef CONFIG_HAS_TCP_REPAIR
-/*
- * It's been reported that both tcp_repair_opt
- * and TCP_ enum already shipped in netinet/tcp.h
- * system header by some distros thus we need a
- * test if we can use predefined ones or provide
- * our own.
- */
-struct tcp_repair_opt {
-	u32	opt_code;
-	u32	opt_val;
-};
-
-enum {
-	TCP_NO_QUEUE,
-	TCP_RECV_QUEUE,
-	TCP_SEND_QUEUE,
-	TCP_QUEUES_NR,
-};
-#endif
-
-#ifndef TCP_TIMESTAMP
-#define TCP_TIMESTAMP	24
-#endif
-
-#ifndef TCP_REPAIR_WINDOW
-#define TCP_REPAIR_WINDOW       29
-#endif
-
-#ifndef TCPOPT_SACK_PERM
-#define TCPOPT_SACK_PERM TCPOPT_SACK_PERMITTED
-#endif
 
 static LIST_HEAD(cpt_tcp_repair_sockets);
 static LIST_HEAD(rst_tcp_repair_sockets);
 
-static int tcp_repair_on(int fd)
-{
-	int ret, aux = 1;
-
-	ret = setsockopt(fd, SOL_TCP, TCP_REPAIR, &aux, sizeof(aux));
-	if (ret < 0)
-		pr_perror("Can't turn TCP repair mode ON");
-
-	return ret;
-}
-
-static int refresh_inet_sk(struct inet_sk_desc *sk, struct tcp_info *ti)
-{
-	int size;
-
-	if (dump_opt(sk->rfd, SOL_TCP, TCP_INFO, ti)) {
-		pr_perror("Failed to obtain TCP_INFO");
-		return -1;
-	}
-
-	switch (ti->tcpi_state) {
-	case TCP_ESTABLISHED:
-	case TCP_CLOSE:
-		break;
-	default:
-		pr_err("Unknown state %d\n", sk->state);
-		return -1;
-	}
-
-	if (ioctl(sk->rfd, SIOCOUTQ, &size) == -1) {
-		pr_perror("Unable to get size of snd queue");
-		return -1;
-	}
-
-	sk->wqlen = size;
-
-	if (ioctl(sk->rfd, SIOCOUTQNSD, &size) == -1) {
-		pr_perror("Unable to get size of unsent data");
-		return -1;
-	}
-
-	sk->uwqlen = size;
-
-	if (ioctl(sk->rfd, SIOCINQ, &size) == -1) {
-		pr_perror("Unable to get size of recv queue");
-		return -1;
-	}
-
-	sk->rqlen = size;
-
-	return 0;
-}
-
 static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 {
 	int ret;
+	struct libsoccr_sk *socr;
 
 	pr_info("\tTurning repair on for socket %x\n", sk->sd.ino);
 	/*
@@ -155,10 +53,11 @@ static int tcp_repair_establised(int fd, struct inet_sk_desc *sk)
 			goto err2;
 	}
 
-	ret = tcp_repair_on(sk->rfd);
-	if (ret < 0)
+	socr = libsoccr_pause(sk->rfd);
+	if (!socr)
 		goto err3;
 
+	sk->priv = socr;
 	list_add_tail(&sk->rlist, &cpt_tcp_repair_sockets);
 	return 0;
 
@@ -183,7 +82,8 @@ static void tcp_unlock_one(struct inet_sk_desc *sk)
 			pr_perror("Failed to unlock TCP connection");
 	}
 
-	tcp_repair_off(sk->rfd);
+	libsoccr_resume(sk->priv);
+	sk->priv = NULL;
 
 	/*
 	 * tcp_repair_off modifies SO_REUSEADDR so
@@ -202,198 +102,57 @@ void cpt_unlock_tcp_connections(void)
 		tcp_unlock_one(sk);
 }
 
-/*
- * TCP queues sequences and their relations to the code below
- *
- *       output queue
- * net <----------------------------- sk
- *        ^       ^       ^    seq >>
- *        snd_una snd_nxt write_seq
- *
- *                     input  queue
- * net -----------------------------> sk
- *     << seq   ^       ^
- *              rcv_nxt copied_seq
- *
- *
- * inq_len  = rcv_nxt - copied_seq = SIOCINQ
- * outq_len = write_seq - snd_una  = SIOCOUTQ
- * inq_seq  = rcv_nxt
- * outq_seq = write_seq
- *
- * On restore kernel moves the option we configure with setsockopt,
- * thus we should advance them on the _len value in restore_tcp_seqs.
- *
- */
-
-static int tcp_stream_get_queue(int sk, int queue_id,
-		u32 *seq, u32 len, char **bufp)
-{
-	int ret, aux;
-	socklen_t auxl;
-	char *buf;
-
-	pr_debug("\tSet repair queue %d\n", queue_id);
-	aux = queue_id;
-	auxl = sizeof(aux);
-	ret = setsockopt(sk, SOL_TCP, TCP_REPAIR_QUEUE, &aux, auxl);
-	if (ret < 0)
-		goto err_sopt;
-
-	pr_debug("\tGet queue seq\n");
-	auxl = sizeof(*seq);
-	ret = getsockopt(sk, SOL_TCP, TCP_QUEUE_SEQ, seq, &auxl);
-	if (ret < 0)
-		goto err_sopt;
-
-	pr_info("\t`- seq %u len %u\n", *seq, len);
-
-	if (len) {
-		/*
-		 * Try to grab one byte more from the queue to
-		 * make sure there are len bytes for real
-		 */
-		buf = xmalloc(len + 1);
-		if (!buf)
-			goto err_buf;
-
-		pr_debug("\tReading queue (%d bytes)\n", len);
-		ret = recv(sk, buf, len + 1, MSG_PEEK | MSG_DONTWAIT);
-		if (ret != len)
-			goto err_recv;
-	} else
-		buf = NULL;
-
-	*bufp = buf;
-	return 0;
-
-err_sopt:
-	pr_perror("\tsockopt failed");
-err_buf:
-	return -1;
-
-err_recv:
-	pr_perror("\trecv failed (%d, want %d, errno %d)", ret, len, errno);
-	xfree(buf);
-	goto err_buf;
-}
-
-static int tcp_stream_get_options(int sk, struct tcp_info *ti, TcpStreamEntry *tse)
-{
-	int ret;
-	socklen_t auxl;
-	int val;
-
-	auxl = sizeof(tse->mss_clamp);
-	ret = getsockopt(sk, SOL_TCP, TCP_MAXSEG, &tse->mss_clamp, &auxl);
-	if (ret < 0)
-		goto err_sopt;
-
-	tse->opt_mask = ti->tcpi_options;
-	if (ti->tcpi_options & TCPI_OPT_WSCALE) {
-		tse->snd_wscale = ti->tcpi_snd_wscale;
-		tse->rcv_wscale = ti->tcpi_rcv_wscale;
-		tse->has_rcv_wscale = true;
-	}
-
-	if (ti->tcpi_options & TCPI_OPT_TIMESTAMPS) {
-		auxl = sizeof(val);
-		ret = getsockopt(sk, SOL_TCP, TCP_TIMESTAMP, &val, &auxl);
-		if (ret < 0)
-			goto err_sopt;
-
-		tse->has_timestamp = true;
-		tse->timestamp = val;
-	}
-
-	pr_info("\toptions: mss_clamp %x wscale %x tstamp %d sack %d\n",
-			(int)tse->mss_clamp,
-			ti->tcpi_options & TCPI_OPT_WSCALE ? (int)tse->snd_wscale : -1,
-			ti->tcpi_options & TCPI_OPT_TIMESTAMPS ? 1 : 0,
-			ti->tcpi_options & TCPI_OPT_SACK ? 1 : 0);
-
-	return 0;
-
-err_sopt:
-	pr_perror("\tsockopt failed");
-	return -1;
-}
-
-static int tcp_get_window(int sk, TcpStreamEntry *tse)
-{
-	struct tcp_repair_window opt;
-	socklen_t optlen = sizeof(opt);
-
-	if (!kdat.has_tcp_window)
-		return 0;
-
-	if (getsockopt(sk, SOL_TCP,
-			TCP_REPAIR_WINDOW, &opt, &optlen)) {
-		pr_perror("Unable to get window properties");
-		return -1;
-	}
-
-	tse->has_snd_wl1	= true;
-	tse->has_snd_wnd	= true;
-	tse->has_max_window	= true;
-	tse->has_rcv_wnd	= true;
-	tse->has_rcv_wup	= true;
-	tse->snd_wl1		= opt.snd_wl1;
-	tse->snd_wnd		= opt.snd_wnd;
-	tse->max_window		= opt.max_window;
-	tse->rcv_wnd		= opt.rcv_wnd;
-	tse->rcv_wup		= opt.rcv_wup;
-
-	return 0;
-}
-
 static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 {
+	struct libsoccr_sk *socr = sk->priv;
 	int ret, aux;
-	struct tcp_info ti;
 	struct cr_img *img;
 	TcpStreamEntry tse = TCP_STREAM_ENTRY__INIT;
-	char *in_buf, *out_buf;
+	char *buf;
+	struct libsoccr_sk_data data;
 
-	ret = refresh_inet_sk(sk, &ti);
+	ret = libsoccr_save(socr, &data, sizeof(data));
 	if (ret < 0)
 		goto err_r;
+	if (ret != sizeof(data)) {
+		pr_err("This libsocr is not supported (%d vs %d)\n",
+				ret, (int)sizeof(data));
+		goto err_r;
+	}
 
-	/*
-	 * Read queue
-	 */
+	sk->state = data.state;
 
-	pr_info("Reading inq for socket\n");
-	tse.inq_len = sk->rqlen;
-	ret = tcp_stream_get_queue(sk->rfd, TCP_RECV_QUEUE,
-			&tse.inq_seq, tse.inq_len, &in_buf);
-	if (ret < 0)
-		goto err_in;
-
-	/*
-	 * Write queue
-	 */
-
-	pr_info("Reading outq for socket\n");
-	tse.outq_len = sk->wqlen;
-	tse.unsq_len = sk->uwqlen;
+	tse.inq_len = data.inq_len;
+	tse.inq_seq = data.inq_seq;
+	tse.outq_len = data.outq_len;
+	tse.outq_seq = data.outq_seq;
+	tse.unsq_len = data.unsq_len;
 	tse.has_unsq_len = true;
-	ret = tcp_stream_get_queue(sk->rfd, TCP_SEND_QUEUE,
-			&tse.outq_seq, tse.outq_len, &out_buf);
-	if (ret < 0)
-		goto err_out;
+	tse.mss_clamp = data.mss_clamp;
+	tse.opt_mask = data.opt_mask;
 
-	/*
-	 * Initial options
-	 */
+	if (tse.opt_mask & TCPI_OPT_WSCALE) {
+		tse.snd_wscale = data.snd_wscale;
+		tse.rcv_wscale = data.rcv_wscale;
+		tse.has_rcv_wscale = true;
+	}
+	if (tse.opt_mask & TCPI_OPT_TIMESTAMPS) {
+		tse.timestamp = data.timestamp;
+		tse.has_timestamp = true;
+	}
 
-	pr_info("Reading options for socket\n");
-	ret = tcp_stream_get_options(sk->rfd, &ti, &tse);
-	if (ret < 0)
-		goto err_opt;
-
-	if (tcp_get_window(sk->rfd, &tse))
-		goto err_opt;
+	if (data.flags & SOCCR_FLAGS_WINDOW) {
+		tse.has_snd_wl1		= true;
+		tse.has_snd_wnd		= true;
+		tse.has_max_window	= true;
+		tse.has_rcv_wnd		= true;
+		tse.has_rcv_wup		= true;
+		tse.snd_wl1		= data.snd_wl1;
+		tse.snd_wnd		= data.snd_wnd;
+		tse.max_window		= data.max_window;
+		tse.rcv_wnd		= data.rcv_wnd;
+		tse.rcv_wup		= data.rcv_wup;
+	}
 
 	/*
 	 * TCP socket options
@@ -427,16 +186,22 @@ static int dump_tcp_conn_state(struct inet_sk_desc *sk)
 	if (ret < 0)
 		goto err_iw;
 
-	if (in_buf) {
-		ret = write_img_buf(img, in_buf, tse.inq_len);
+	buf = libsoccr_get_queue_bytes(socr, TCP_RECV_QUEUE, SOCCR_MEM_EXCL);
+	if (buf) {
+		ret = write_img_buf(img, buf, tse.inq_len);
 		if (ret < 0)
 			goto err_iw;
+
+		xfree(buf);
 	}
 
-	if (out_buf) {
-		ret = write_img_buf(img, out_buf, tse.outq_len);
+	buf = libsoccr_get_queue_bytes(socr, TCP_SEND_QUEUE, SOCCR_MEM_EXCL);
+	if (buf) {
+		ret = write_img_buf(img, buf, tse.outq_len);
 		if (ret < 0)
 			goto err_iw;
+
+		xfree(buf);
 	}
 
 	pr_info("Done\n");
@@ -444,17 +209,13 @@ err_iw:
 	close_image(img);
 err_img:
 err_opt:
-	xfree(out_buf);
-err_out:
-	xfree(in_buf);
-err_in:
 err_r:
 	return ret;
 }
 
 int dump_one_tcp(int fd, struct inet_sk_desc *sk)
 {
-	if (sk->state != TCP_ESTABLISHED)
+	if (sk->dst_port == 0)
 		return 0;
 
 	pr_info("Dumping TCP connection\n");
@@ -472,39 +233,9 @@ int dump_one_tcp(int fd, struct inet_sk_desc *sk)
 	return 0;
 }
 
-static int set_tcp_queue_seq(int sk, int queue, u32 seq)
+static int read_tcp_queue(struct libsoccr_sk *sk, struct libsoccr_sk_data *data,
+		int queue, u32 len, struct cr_img *img)
 {
-	pr_debug("\tSetting %d queue seq to %u\n", queue, seq);
-
-	if (setsockopt(sk, SOL_TCP, TCP_REPAIR_QUEUE, &queue, sizeof(queue)) < 0) {
-		pr_perror("Can't set repair queue");
-		return -1;
-	}
-
-	if (setsockopt(sk, SOL_TCP, TCP_QUEUE_SEQ, &seq, sizeof(seq)) < 0) {
-		pr_perror("Can't set queue seq");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int restore_tcp_seqs(int sk, TcpStreamEntry *tse)
-{
-	if (set_tcp_queue_seq(sk, TCP_RECV_QUEUE,
-				tse->inq_seq - tse->inq_len))
-		return -1;
-	if (set_tcp_queue_seq(sk, TCP_SEND_QUEUE,
-				tse->outq_seq - tse->outq_len))
-		return -1;
-
-	return 0;
-}
-
-static int __send_tcp_queue(int sk, int queue, u32 len, struct cr_img *img)
-{
-	int ret, err = -1, max_chunk;
-	int off;
 	char *buf;
 
 	buf = xmalloc(len);
@@ -514,175 +245,35 @@ static int __send_tcp_queue(int sk, int queue, u32 len, struct cr_img *img)
 	if (read_img_buf(img, buf, len) < 0)
 		goto err;
 
-	max_chunk = len;
-	off = 0;
+	return libsoccr_set_queue_bytes(sk, queue, buf, SOCCR_MEM_EXCL);
 
-	do {
-		int chunk = len;
-
-		if (chunk > max_chunk)
-			chunk = max_chunk;
-
-		ret = send(sk, buf + off, chunk, 0);
-		if (ret <= 0) {
-			if (max_chunk > 1024) {
-				/*
-				 * Kernel not only refuses the whole chunk,
-				 * but refuses to split it into pieces too.
-				 *
-				 * When restoring recv queue in repair mode
-				 * kernel doesn't try hard and just allocates
-				 * a linear skb with the size we pass to the
-				 * system call. Thus, if the size is too big
-				 * for slab allocator, the send just fails
-				 * with ENOMEM.
-				 *
-				 * In any case -- try smaller chunk, hopefully
-				 * there's still enough memory in the system.
-				 */
-				max_chunk >>= 1;
-				continue;
-			}
-
-			pr_perror("Can't restore %d queue data (%d), want (%d:%d:%d)",
-				  queue, ret, chunk, len, max_chunk);
-			goto err;
-		}
-		off += ret;
-		len -= ret;
-	} while (len);
-
-	err = 0;
 err:
 	xfree(buf);
-
-	return err;
+	return -1;
 }
 
-static int send_tcp_queue(int sk, int queue, u32 len, struct cr_img *img)
-{
-	pr_debug("\tRestoring TCP %d queue data %u bytes\n", queue, len);
-
-	if (setsockopt(sk, SOL_TCP, TCP_REPAIR_QUEUE, &queue, sizeof(queue)) < 0) {
-		pr_perror("Can't set repair queue");
-		return -1;
-	}
-
-	return __send_tcp_queue(sk, queue, len, img);
-}
-
-static int restore_tcp_queues(int sk, TcpStreamEntry *tse, struct cr_img *img)
+static int read_tcp_queues(struct libsoccr_sk *sk, struct libsoccr_sk_data *data, struct cr_img *img)
 {
 	u32 len;
 
-	len = tse->inq_len;
-	if (len && send_tcp_queue(sk, TCP_RECV_QUEUE, len, img))
+	len = data->inq_len;
+	if (len && read_tcp_queue(sk, data, TCP_RECV_QUEUE, len, img))
 		return -1;
 
-	/*
-	 * All data in a write buffer can be divided on two parts sent
-	 * but not yet acknowledged data and unsent data.
-	 * The TCP stack must know which data have been sent, because
-	 * acknowledgment can be received for them. These data must be
-	 * restored in repair mode.
-	 */
-	len = tse->outq_len - tse->unsq_len;
-	if (len && send_tcp_queue(sk, TCP_SEND_QUEUE, len, img))
-		return -1;
-
-	/*
-	 * The second part of data have never been sent to outside, so
-	 * they can be restored without any tricks.
-	 */
-	len = tse->unsq_len;
-	tcp_repair_off(sk);
-	if (len && __send_tcp_queue(sk, TCP_SEND_QUEUE, len, img))
-		return -1;
-	if (tcp_repair_on(sk))
+	len = data->outq_len;
+	if (len && read_tcp_queue(sk, data, TCP_SEND_QUEUE, len, img))
 		return -1;
 
 	return 0;
 }
 
-static int restore_tcp_opts(int sk, TcpStreamEntry *tse)
-{
-	struct tcp_repair_opt opts[4];
-	int onr = 0;
-
-	pr_debug("\tRestoring TCP options\n");
-
-	if (tse->opt_mask & TCPI_OPT_SACK) {
-		pr_debug("\t\tWill turn SAK on\n");
-		opts[onr].opt_code = TCPOPT_SACK_PERM;
-		opts[onr].opt_val = 0;
-		onr++;
-	}
-
-	if (tse->opt_mask & TCPI_OPT_WSCALE) {
-		pr_debug("\t\tWill set snd_wscale to %u\n", tse->snd_wscale);
-		pr_debug("\t\tWill set rcv_wscale to %u\n", tse->rcv_wscale);
-		opts[onr].opt_code = TCPOPT_WINDOW;
-		opts[onr].opt_val = tse->snd_wscale + (tse->rcv_wscale << 16);
-		onr++;
-	}
-
-	if (tse->opt_mask & TCPI_OPT_TIMESTAMPS) {
-		pr_debug("\t\tWill turn timestamps on\n");
-		opts[onr].opt_code = TCPOPT_TIMESTAMP;
-		opts[onr].opt_val = 0;
-		onr++;
-	}
-
-	pr_debug("Will set mss clamp to %u\n", tse->mss_clamp);
-	opts[onr].opt_code = TCPOPT_MAXSEG;
-	opts[onr].opt_val = tse->mss_clamp;
-	onr++;
-
-	if (setsockopt(sk, SOL_TCP, TCP_REPAIR_OPTIONS,
-				opts, onr * sizeof(struct tcp_repair_opt)) < 0) {
-		pr_perror("Can't repair options");
-		return -1;
-	}
-
-	if (tse->has_timestamp) {
-		if (setsockopt(sk, SOL_TCP, TCP_TIMESTAMP,
-				&tse->timestamp, sizeof(tse->timestamp)) < 0) {
-			pr_perror("Can't set timestamp");
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static int restore_tcp_window(int sk, TcpStreamEntry *tse)
-{
-	struct tcp_repair_window opt = {
-		.snd_wl1 = tse->snd_wl1,
-		.snd_wnd = tse->snd_wnd,
-		.max_window = tse->max_window,
-		.rcv_wnd = tse->rcv_wnd,
-		.rcv_wup = tse->rcv_wup,
-	};
-
-	if (!kdat.has_tcp_window || !tse->has_snd_wnd) {
-		pr_warn_once("Window parameters are not restored\n");
-		return 0;
-	}
-
-	if (setsockopt(sk, SOL_TCP, TCP_REPAIR_WINDOW, &opt, sizeof(opt))) {
-		pr_perror("Unable to set window parameters");
-		return -1;
-	}
-
-	return 0;
-}
-
-static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
+static int restore_tcp_conn_state(int sk, struct libsoccr_sk *socr, struct inet_sk_info *ii)
 {
 	int aux;
 	struct cr_img *img;
 	TcpStreamEntry *tse;
+	struct libsoccr_sk_data data = {};
+	union libsoccr_addr sa_src, sa_dst;
 
 	pr_info("Restoring TCP connection id %x ino %x\n", ii->ie->id, ii->ie->ino);
 
@@ -693,25 +284,69 @@ static int restore_tcp_conn_state(int sk, struct inet_sk_info *ii)
 	if (pb_read_one(img, &tse, PB_TCP_STREAM) < 0)
 		goto err_c;
 
-	if (restore_tcp_seqs(sk, tse))
+	if (!tse->has_unsq_len) {
+		pr_err("No unsq len in the image\n");
+		goto err_c;
+	}
+
+	data.state = ii->ie->state;;
+	data.inq_len = tse->inq_len;
+	data.inq_seq = tse->inq_seq;
+	data.outq_len = tse->outq_len;
+	data.outq_seq = tse->outq_seq;
+	data.unsq_len = tse->unsq_len;
+	data.mss_clamp = tse->mss_clamp;
+	data.opt_mask = tse->opt_mask;
+	if (tse->opt_mask & TCPI_OPT_WSCALE) {
+		if (!tse->has_rcv_wscale) {
+			pr_err("No rcv wscale in the image\n");
+			goto err_c;
+		}
+
+		data.snd_wscale = tse->snd_wscale;
+		data.rcv_wscale = tse->rcv_wscale;
+	}
+	if (tse->opt_mask & TCPI_OPT_TIMESTAMPS) {
+		if (!tse->has_timestamp) {
+			pr_err("No timestamp in the image\n");
+			goto err_c;
+		}
+
+		data.timestamp = tse->timestamp;
+	}
+
+	if (tse->has_snd_wnd) {
+		data.flags |= SOCCR_FLAGS_WINDOW;
+		data.snd_wl1 = tse->snd_wl1;
+		data.snd_wnd = tse->snd_wnd;
+		data.max_window = tse->max_window;
+		data.rcv_wnd = tse->rcv_wnd;
+		data.rcv_wup = tse->rcv_wup;
+	}
+
+	if (restore_sockaddr(&sa_src,
+				ii->ie->family, ii->ie->src_port,
+				ii->ie->src_addr, 0) < 0)
+		goto err_c;
+	if (restore_sockaddr(&sa_dst,
+				ii->ie->family, ii->ie->dst_port,
+				ii->ie->dst_addr, 0) < 0)
 		goto err_c;
 
-	if (inet_bind(sk, ii))
-		goto err_c;
+	libsoccr_set_addr(socr, 1, &sa_src, 0);
+	libsoccr_set_addr(socr, 0, &sa_dst, 0);
 
-	if (inet_connect(sk, ii))
-		goto err_c;
-
-	if (restore_tcp_opts(sk, tse))
-		goto err_c;
-
+	/*
+	 * O_NONBLOCK has to be set before libsoccr_restore(),
+	 * it is required to restore syn-sent sockets.
+	 */
 	if (restore_prepare_socket(sk))
 		goto err_c;
 
-	if (restore_tcp_queues(sk, tse, img))
+	if (read_tcp_queues(socr, &data, img))
 		goto err_c;
 
-	if (restore_tcp_window(sk, tse))
+	if (libsoccr_restore(socr, &data, sizeof(data)))
 		goto err_c;
 
 	if (tse->has_nodelay && tse->nodelay) {
@@ -768,12 +403,15 @@ int prepare_tcp_socks(struct task_restore_args *ta)
 
 int restore_one_tcp(int fd, struct inet_sk_info *ii)
 {
+	struct libsoccr_sk *sk;
+
 	pr_info("Restoring TCP connection\n");
 
-	if (tcp_repair_on(fd))
+	sk = libsoccr_pause(fd);
+	if (!sk)
 		return -1;
 
-	if (restore_tcp_conn_state(fd, ii))
+	if (restore_tcp_conn_state(fd, sk, ii))
 		return -1;
 
 	return 0;
@@ -796,69 +434,3 @@ void rst_unlock_tcp_connections(void)
 	list_for_each_entry(ii, &rst_tcp_repair_sockets, rlist)
 		nf_unlock_connection_info(ii);
 }
-
-int check_tcp(void)
-{
-	socklen_t optlen;
-	int sk, ret;
-	int val;
-
-	sk = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sk < 0) {
-		pr_perror("Can't create TCP socket :(");
-		return -1;
-	}
-
-	ret = tcp_repair_on(sk);
-	if (ret)
-		goto out;
-
-	optlen = sizeof(val);
-	ret = getsockopt(sk, SOL_TCP, TCP_TIMESTAMP, &val, &optlen);
-	if (ret)
-		pr_perror("Can't get TCP_TIMESTAMP");
-
-out:
-	close(sk);
-
-	return ret;
-}
-
-int kerndat_tcp_repair_window()
-{
-	struct tcp_repair_window opt;
-	socklen_t optlen = sizeof(opt);
-	int sk, val = 1;
-
-	sk = socket(AF_INET, SOCK_STREAM, 0);
-	if (sk < 0) {
-		pr_perror("Unable to create inet socket");
-		return -1;
-	}
-
-	if (setsockopt(sk, SOL_TCP, TCP_REPAIR, &val, sizeof(val))) {
-		if (errno == EPERM) {
-			kdat.has_tcp_window = false;
-			pr_warn("TCP_REPAIR isn't available to unprivileged users\n");
-			close(sk);
-			return 0;
-		}
-		pr_perror("Unable to set TCP_REPAIR");
-		close(sk);
-		return -1;
-	}
-
-	if (getsockopt(sk, SOL_TCP, TCP_REPAIR_WINDOW, &opt, &optlen)) {
-		if (errno != ENOPROTOOPT) {
-			pr_perror("Unable to set TCP_REPAIR_WINDOW");
-			close(sk);
-			return -1;
-		}
-		kdat.has_tcp_window = false;
-	} else
-		kdat.has_tcp_window = true;
-	close(sk);
-
-	return 0;
-}
-

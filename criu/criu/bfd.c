@@ -7,13 +7,15 @@
 #include <sys/uio.h>
 #include <errno.h>
 
-#include "bug.h"
+#include "int.h"
 #include "log.h"
+#include "common/bug.h"
 #include "bfd.h"
-#include "list.h"
+#include "common/list.h"
 #include "util.h"
 #include "xmalloc.h"
-#include "asm/page.h"
+#include "page.h"
+
 
 #undef	LOG_PREFIX
 #define LOG_PREFIX "bfd: "
@@ -179,7 +181,10 @@ char *breadchr(struct bfd *f, char c)
 	char *n;
 	unsigned int ss = 0;
 
+
+//	printf("b->sz at breadchr is %d\n", b->sz);
 again:
+//	printf("b->sz is %d\n", b->sz);
 	n = strnchr(b->data + ss, b->sz - ss, c);
 	if (n) {
 		char *ret;
@@ -255,8 +260,9 @@ static int __bwrite(struct bfd *bfd, const void *buf, int size)
 			return ret;
 	}
 
-	if (size > BUFSIZE)
+	if (size > BUFSIZE){
 		return write(bfd->fd, buf, size);
+	}
 
 	memcpy(b->data + b->sz, buf, size);
 	b->sz += size;

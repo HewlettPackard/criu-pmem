@@ -1,11 +1,7 @@
-include ../Makefile.inc
-
-LIBDIR	= ../lib
-LIB	= $(LIBDIR)/libzdtmtst.a
-LDLIBS	+= $(LIBDIR)/libzdtmtst.a
-override CPPFLAGS += -I$(LIBDIR)
-CFLAGS	= -g -O2 -Wall -Werror -fno-strict-aliasing
-CFLAGS	+= $(USERCFLAGS)
+LIBDIR	:= ../lib
+LIB	:= $(LIBDIR)/libzdtmtst.a
+LDLIBS	+= $(LIB)
+CPPFLAGS += -I$(LIBDIR)
 
 TST_NOFILE	=	\
 		ipc		\
@@ -23,6 +19,7 @@ TST_NOFILE	=	\
 		file_aio        \
 		socket-tcp      \
 		socket-tcp6     \
+		shmem		\
 
 
 TST_FILE	=	\
@@ -39,9 +36,7 @@ DEP	= $(SRC:%.c=%.d)
 PID	= $(TST:%=%.pid)
 OUT	= $(TST:%=%.out)
 
-%: %.c
-	$(Q)echo $@ >> .gitignore
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $(LOADLIBES) $^ $(LDLIBS) -o $@
+include ../Makefile.inc
 
 all:	$(TST)
 install: all
@@ -64,25 +59,25 @@ start:	$(PID)
 check_start:	$(PID:%.pid=%.is_running)
 
 stop:
-	-kill -TERM `cat *.pid`
+	-kill -TERM `awk '{print}' *.pid`
 
 WAIT_TIME=10
 wait_stop:
 	-for i in `seq 1 $(WAIT_TIME)`; do \
-		kill -0 `cat *.pid 2>/dev/null` 2>/dev/null || break; \
+		kill -0 `awk '{print}' *.pid 2>/dev/null` 2>/dev/null || break; \
 		sleep 1; \
 	done
 
-$(TST):	$(LIB)
+$(TST):	| $(LIB)
 
-file_aio:	override LDLIBS += -lrt -pthread
-socket-tcp:	override CFLAGS += -D STREAM
-socket-tcp6:	override CFLAGS += -D ZDTM_IPV6 -D STREAM
-ptrace.o:	override CFLAGS += -pthread
-ptrace:		override LDFLAGS += -pthread
-fork2:		override CFLAGS += -D FORK2
-thread-bomb.o:	override CFLAGS += -pthread
-thread-bomb:	override LDFLAGS += -pthread
+file_aio:	LDLIBS += -lrt -pthread
+socket-tcp:	CFLAGS += -D STREAM
+socket-tcp6:	CFLAGS += -D ZDTM_IPV6 -D STREAM
+ptrace.o:	CFLAGS += -pthread
+ptrace:		LDFLAGS += -pthread
+fork2:		CFLAGS += -D FORK2
+thread-bomb.o:	CFLAGS += -pthread
+thread-bomb:	LDFLAGS += -pthread
 
 %: %.sh
 	cp $< $@
@@ -91,21 +86,4 @@ thread-bomb:	override LDFLAGS += -pthread
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)
 
-gitignore-clean:
-	$(RM) -f .gitignore
-
-clean:	gitignore-clean
-	$(RM) -f $(OBJ) $(TST) *~
-
-cleandep:	clean
-	$(RM) -f $(DEP)
-
-%.cleanout: %
-	$(Q) $(RM) -f -r $<.pid* $<.out* $<.test chew_$<.test*
-
-cleanout:
-	$(RM) -f *.pid *.out* *.test chew*
-
-realclean:	cleandep cleanout
-
-.PHONY:	force clean cleandep cleanout realclean start check_start stop wait_stop
+.PHONY:	force start check_start stop wait_stop

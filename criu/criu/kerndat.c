@@ -7,21 +7,29 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/sysmacros.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>  /* for sockaddr_in and inet_ntoa() */
 
+#include "int.h"
 #include "log.h"
-#include "bug.h"
+#include "restorer.h"
 #include "kerndat.h"
 #include "fs-magic.h"
 #include "mem.h"
-#include "compiler.h"
+#include "common/compiler.h"
 #include "sysctl.h"
-#include "asm/types.h"
 #include "cr_options.h"
 #include "util.h"
 #include "lsm.h"
 #include "proc_parse.h"
 #include "config.h"
-#include "syscall-codes.h"
+#include "sk-inet.h"
+#include <compel/plugins/std/syscall-codes.h>
+#include <compel/compel.h>
+#include "netfilter.h"
 
 struct kerndat_s kdat = {
 };
@@ -74,10 +82,8 @@ static int parse_self_maps(unsigned long vm_start, dev_t *device)
 	char buf[1024];
 
 	maps = fopen_proc(PROC_SELF, "maps");
-	if (maps == NULL) {
-		pr_perror("Can't open self maps");
+	if (maps == NULL)
 		return -1;
-	}
 
 	while (fgets(buf, sizeof(buf), maps) != NULL) {
 		char *end, *aux;
@@ -105,6 +111,39 @@ static int parse_self_maps(unsigned long vm_start, dev_t *device)
 
 	fclose(maps);
 	return -1;
+}
+
+static void kerndat_mmap_min_addr(void)
+{
+	/* From kernel's default CONFIG_LSM_MMAP_MIN_ADDR */
+	static const unsigned long default_mmap_min_addr = 65536;
+	uint64_t value;
+
+	struct sysctl_req req[] = {
+		{
+			.name	= "vm/mmap_min_addr",
+			.arg	= &value,
+			.type	= CTL_U64,
+		},
+	};
+
+	if (sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0)) {
+		pr_warn("Can't fetch %s value, use default %#lx\n",
+			req[0].name, (unsigned long)default_mmap_min_addr);
+		kdat.mmap_min_addr = default_mmap_min_addr;
+		return;
+	}
+
+	if (value < default_mmap_min_addr) {
+		pr_debug("Adjust mmap_min_addr %#lx -> %#lx\n",
+			 (unsigned long)value,
+			 (unsigned long)default_mmap_min_addr);
+		kdat.mmap_min_addr = default_mmap_min_addr;
+	} else
+		kdat.mmap_min_addr = value;
+
+	pr_debug("Found mmap_min_addr %#lx\n",
+		 (unsigned long)kdat.mmap_min_addr);
 }
 
 static int kerndat_get_shmemdev(void)
@@ -256,9 +295,8 @@ int kerndat_get_dirty_track(void)
 		goto no_dt;
 
 	ret = -1;
-	pm2 = open("/proc/self/pagemap", O_RDONLY);
+	pm2 = open_proc(PROC_SELF, "pagemap");
 	if (pm2 < 0) {
-		pr_perror("Can't open pagemap file");
 		munmap(map, PAGE_SIZE);
 		return ret;
 	}
@@ -349,7 +387,7 @@ static bool kerndat_has_memfd_create(void)
 
 static int get_task_size(void)
 {
-	kdat.task_size = task_size();
+	kdat.task_size = compel_task_size();
 	pr_debug("Found task size of %lx\n", kdat.task_size);
 	return 0;
 }
@@ -359,11 +397,9 @@ int kerndat_fdinfo_has_lock()
 	int fd, pfd = -1, exit_code = -1, len;
 	char buf[PAGE_SIZE];
 
-	fd = open("/proc/locks", O_RDONLY);
-	if (fd < 0) {
-		pr_perror("Unable to open /proc/locks");
+	fd = open_proc(PROC_GEN, "locks");
+	if (fd < 0)
 		return -1;
-	}
 
 	if (flock(fd, LOCK_SH)) {
 		pr_perror("Can't take a lock");
@@ -406,22 +442,19 @@ static int get_ipv6()
 	return 0;
 }
 
-int kerndat_loginuid(bool only_dump)
+int kerndat_loginuid(void)
 {
 	unsigned int saved_loginuid;
 	int ret;
 
-	kdat.has_loginuid = false;
+	kdat.luid = LUID_NONE;
 
 	/* No such file: CONFIG_AUDITSYSCALL disabled */
 	saved_loginuid = parse_pid_loginuid(PROC_SELF, &ret, true);
 	if (ret < 0)
 		return 0;
 
-	if (only_dump) {
-		kdat.has_loginuid = true;
-		return 0;
-	}
+	kdat.luid = LUID_READ;
 
 	/*
 	 * From kernel v3.13-rc2 it's possible to unset loginuid value,
@@ -434,24 +467,189 @@ int kerndat_loginuid(bool only_dump)
 	if (prepare_loginuid(saved_loginuid, LOG_WARN) < 0)
 		return 0;
 
-	kdat.has_loginuid = true;
+	kdat.luid = LUID_FULL;
 	return 0;
 }
 
 static int kerndat_iptables_has_xtlocks(void)
 {
+	int fd;
 	char *argv[4] = { "sh", "-c", "iptables -w -L", NULL };
 
+	fd = open("/dev/null", O_RDWR);
+	if (fd < 0) {
+		fd = -1;
+		pr_perror("failed to open /dev/null, using log fd for xtlocks check");
+	}
+
 	kdat.has_xtlocks = 1;
-	if (cr_system(-1, -1, -1, "sh", argv, CRS_CAN_FAIL) == -1)
+	if (cr_system(fd, fd, fd, "sh", argv, CRS_CAN_FAIL) == -1)
 		kdat.has_xtlocks = 0;
 
+	close_safe(&fd);
 	return 0;
+}
+
+int kerndat_tcp_repair(void)
+{
+	int sock, clnt = -1, yes = 1, exit_code = -1;
+	struct sockaddr_in addr;
+	socklen_t aux;
+
+	memset(&addr,0,sizeof(addr));
+	addr.sin_family = AF_INET;
+	inet_pton(AF_INET, "127.0.0.1", &(addr.sin_addr));
+	addr.sin_port = 0;
+	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0) {
+		pr_perror("Unable to create a socket");
+		return -1;
+	}
+
+	if (bind(sock, (struct sockaddr *) &addr, sizeof(addr))) {
+		pr_perror("Unable to bind a socket");
+		goto err;
+	}
+
+	aux = sizeof(addr);
+	if (getsockname(sock, (struct sockaddr *) &addr, &aux)) {
+		pr_perror("Unable to get a socket name");
+		goto err;
+	}
+
+	if (listen(sock, 1)) {
+		pr_perror("Unable to listen a socket");
+		goto err;
+	}
+
+	clnt = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (clnt < 0) {
+		pr_perror("Unable to create a socket");
+		goto err;
+	}
+
+	if (connect(clnt, (struct sockaddr *) &addr, sizeof(addr))) {
+		pr_perror("Unable to connect a socket");
+		goto err;
+	}
+
+	if (shutdown(clnt, SHUT_WR)) {
+		pr_perror("Unable to shutdown a socket");
+		goto err;
+	}
+
+	if (setsockopt(clnt, SOL_TCP, TCP_REPAIR, &yes, sizeof(yes))) {
+		if (errno != EPERM)
+			goto err;
+		kdat.has_tcp_half_closed = false;
+	} else
+		kdat.has_tcp_half_closed = true;
+
+	exit_code = 0;
+err:
+	close_safe(&clnt);
+	close(sock);
+
+	return exit_code;
+}
+
+static int kerndat_compat_restore(void)
+{
+	int ret = kdat_compatible_cr();
+
+	if (ret < 0) /* failure */
+		return ret;
+	kdat.compat_cr = !!ret;
+	return 0;
+}
+
+#define KERNDAT_CACHE_FILE	KDAT_RUNDIR"/criu.kdat"
+#define KERNDAT_CACHE_FILE_TMP	KDAT_RUNDIR"/.criu.kdat"
+
+static int kerndat_try_load_cache(void)
+{
+	int fd, ret;
+
+	fd = open(KERNDAT_CACHE_FILE, O_RDONLY);
+	if (fd < 0) {
+		pr_warn("Can't load %s\n", KERNDAT_CACHE_FILE);
+		return 1;
+	}
+
+	ret = read(fd, &kdat, sizeof(kdat));
+	if (ret < 0) {
+		pr_perror("Can't read kdat cache");
+		return -1;
+	}
+
+	close(fd);
+
+	if (ret != sizeof(kdat) ||
+			kdat.magic1 != KDAT_MAGIC ||
+			kdat.magic2 != KDAT_MAGIC_2) {
+		pr_warn("Stale %s file\n", KERNDAT_CACHE_FILE);
+		unlink(KERNDAT_CACHE_FILE);
+		return 1;
+	}
+
+	pr_info("Loaded kdat cache from %s\n", KERNDAT_CACHE_FILE);
+	return 0;
+}
+
+static void kerndat_save_cache(void)
+{
+	int fd, ret;
+	struct statfs s;
+
+	fd = open(KERNDAT_CACHE_FILE_TMP, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	if (fd < 0)
+		/*
+		 * It can happen that we race with some other criu
+		 * instance. That's OK, just ignore this error and
+		 * proceed.
+		 */
+		return;
+
+	if (fstatfs(fd, &s) < 0 || s.f_type != TMPFS_MAGIC) {
+		pr_warn("Can't keep kdat cache on non-tempfs\n");
+		close(fd);
+		goto unl;
+	}
+
+	/*
+	 * One magic to make sure we're reading the kdat file.
+	 * One more magic to make somehow sure we don't read kdat
+	 * from some other criu
+	 */
+	kdat.magic1 = KDAT_MAGIC;
+	kdat.magic2 = KDAT_MAGIC_2;
+	ret = write(fd, &kdat, sizeof(kdat));
+	close(fd);
+
+	if (ret == sizeof(kdat))
+		ret = rename(KERNDAT_CACHE_FILE_TMP, KERNDAT_CACHE_FILE);
+	else {
+		ret = -1;
+		errno = EIO;
+	}
+
+	if (ret < 0) {
+		pr_perror("Couldn't save %s", KERNDAT_CACHE_FILE);
+unl:
+		unlink(KERNDAT_CACHE_FILE_TMP);
+	}
 }
 
 int kerndat_init(void)
 {
 	int ret;
+
+	ret = kerndat_try_load_cache();
+	if (ret <= 0)
+		return ret;
+
+	preload_socket_modules();
+	preload_netfilter_modules();
 
 	ret = check_pagemap();
 	if (!ret)
@@ -469,53 +667,21 @@ int kerndat_init(void)
 	if (!ret)
 		ret = get_ipv6();
 	if (!ret)
-		ret = kerndat_loginuid(true);
+		ret = kerndat_loginuid();
 	if (!ret)
 		ret = kerndat_iptables_has_xtlocks();
 	if (!ret)
-		ret = kerndat_tcp_repair_window();
-
-	kerndat_lsm();
-
-	return ret;
-}
-
-int kerndat_init_rst(void)
-{
-	int ret;
-
-	/*
-	 * Read TCP sysctls before anything else,
-	 * since the limits we're interested in are
-	 * not available inside namespaces.
-	 */
-
-	ret = check_pagemap();
+		ret = kerndat_tcp_repair();
 	if (!ret)
-		ret = get_last_cap();
+		ret = kerndat_compat_restore();
 	if (!ret)
 		ret = kerndat_has_memfd_create();
-	if (!ret)
-		ret = get_task_size();
-	if (!ret)
-		ret = get_ipv6();
-	if (!ret)
-		ret = kerndat_loginuid(false);
-	if (!ret)
-		ret = kerndat_iptables_has_xtlocks();
-	if (!ret)
-		ret = kerndat_tcp_repair_window();
 
 	kerndat_lsm();
+	kerndat_mmap_min_addr();
 
-	return ret;
-}
-
-int kerndat_init_cr_exec(void)
-{
-	int ret;
-
-	ret = get_task_size();
+	if (!ret)
+		kerndat_save_cache();
 
 	return ret;
 }

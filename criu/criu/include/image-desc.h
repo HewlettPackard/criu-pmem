@@ -1,7 +1,7 @@
 #ifndef __CR_IMAGE_DESC_H__
 #define __CR_IMAGE_DESC_H__
 
-#include "asm/int.h"
+#include "int.h"
 
 enum {
 	CR_FD_INVENTORY,
@@ -14,7 +14,6 @@ enum {
 	CR_FD_CORE,
 	CR_FD_IDS,
 	CR_FD_MM,
-	CR_FD_SIGACT,
 	CR_FD_CREDS,
 	CR_FD_FS,
 	_CR_FD_TASK_TO,
@@ -86,8 +85,10 @@ enum {
 	CR_FD_TMPFS_IMG,
 	CR_FD_TMPFS_DEV,
 	CR_FD_BINFMT_MISC,
+	CR_FD_BINFMT_MISC_OLD,
 	CR_FD_PAGES,
 
+	CR_FD_SIGACT,
 	CR_FD_VMAS,
 	CR_FD_PAGES_OLD,
 	CR_FD_SHM_PAGES_OLD,

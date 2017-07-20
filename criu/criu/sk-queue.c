@@ -10,8 +10,7 @@
 #include <sys/socket.h>
 #include <sys/sendfile.h>
 
-#include "asm/types.h"
-#include "list.h"
+#include "common/list.h"
 #include "imgset.h"
 #include "image.h"
 #include "servicefd.h"
@@ -28,7 +27,7 @@
 struct sk_packet {
 	struct list_head	list;
 	SkPacketEntry		*entry;
-	off_t			img_off;
+	char        		*data;
 };
 
 static LIST_HEAD(packets_list);
@@ -38,14 +37,20 @@ static int collect_one_packet(void *obj, ProtobufCMessage *msg, struct cr_img *i
 	struct sk_packet *pkt = obj;
 
 	pkt->entry = pb_msg(msg, SkPacketEntry);
-	pkt->img_off = lseek(img_raw_fd(img), 0, SEEK_CUR);
+
+	pkt->data = xmalloc(pkt->entry->length);
+	if (pkt->data ==NULL)
+		return -1;
+
 	/*
 	 * NOTE: packet must be added to the tail. Otherwise sequence
 	 * will be broken.
 	 */
 	list_add_tail(&pkt->list, &packets_list);
-	if (lseek(img_raw_fd(img), pkt->entry->length, SEEK_CUR) < 0) {
-		pr_perror("Unable to change an image offset");
+
+	if (read_img_buf(img, pkt->data, pkt->entry->length) != 1) {
+		xfree(pkt->data);
+		pr_perror("Unable to read packet data");
 		return -1;
 	}
 
@@ -58,6 +63,24 @@ struct collect_image_info sk_queues_cinfo = {
 	.priv_size = sizeof(struct sk_packet),
 	.collect = collect_one_packet,
 };
+
+/*
+ * Maximum size of the control messages. XXX -- is there any
+ * way to get this value out of the kernel?
+ * */
+#define CMSG_MAX_SIZE	1024
+
+static int dump_packet_cmsg(struct msghdr *mh, SkPacketEntry *pe)
+{
+	struct cmsghdr *ch;
+
+	for (ch = CMSG_FIRSTHDR(mh); ch; ch = CMSG_NXTHDR(mh, ch)) {
+		pr_err("Control messages in queue, not supported\n");
+		return -1;
+	}
+
+	return 0;
+}
 
 int dump_sk_queue(int sock_fd, int sock_id)
 {
@@ -109,6 +132,7 @@ int dump_sk_queue(int sock_fd, int sock_id)
 	pe.id_for = sock_id;
 
 	while (1) {
+		char cmsg[CMSG_MAX_SIZE];
 		struct iovec iov = {
 			.iov_base	= data,
 			.iov_len	= size,
@@ -116,6 +140,8 @@ int dump_sk_queue(int sock_fd, int sock_id)
 		struct msghdr msg = {
 			.msg_iov	= &iov,
 			.msg_iovlen	= 1,
+			.msg_control	= &cmsg,
+			.msg_controllen	= sizeof(cmsg),
 		};
 
 		ret = pe.length = recvmsg(sock_fd, &msg, MSG_DONTWAIT | MSG_PEEK);
@@ -140,6 +166,9 @@ int dump_sk_queue(int sock_fd, int sock_id)
 			ret = -E2BIG;
 			goto err_set_sock;
 		}
+
+		if (dump_packet_cmsg(&msg, &pe))
+			goto err_set_sock;
 
 		ret = pb_write_one(img_from_set(glob_imgset, CR_FD_SK_QUEUES), &pe, PB_SK_QUEUES);
 		if (ret < 0) {
@@ -185,7 +214,6 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 
 	list_for_each_entry_safe(pkt, tmp, &packets_list, list) {
 		SkPacketEntry *entry = pkt->entry;
-		char *buf;
 
 		if (entry->id_for != peer_id)
 			continue;
@@ -201,22 +229,8 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 		 * boundaries messages should be saved.
 		 */
 
-		buf = xmalloc(entry->length);
-		if (buf ==NULL)
-			goto err;
-
-		if (lseek(img_raw_fd(img), pkt->img_off, SEEK_SET) == -1) {
-			pr_perror("lseek() failed");
-			xfree(buf);
-			goto err;
-		}
-		if (read_img_buf(img, buf, entry->length) != 1) {
-			xfree(buf);
-			goto err;
-		}
-
-		ret = write(fd, buf, entry->length);
-		xfree(buf);
+		ret = write(fd, pkt->data, entry->length);
+		xfree(pkt->data);
 		if (ret < 0) {
 			pr_perror("Failed to send packet");
 			goto err;

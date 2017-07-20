@@ -5,9 +5,10 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 
-#include "asm/types.h"
+#include "../soccr/soccr.h"
+
 #include "util.h"
-#include "list.h"
+#include "common/list.h"
 #include "files.h"
 #include "netfilter.h"
 #include "sockets.h"
@@ -22,7 +23,7 @@ static char buf[512];
  */
 
 #define NF_CONN_CMD	"%s %s -t filter %s %s --protocol tcp " \
-	"--source %s --sport %d --destination %s --dport %d -j DROP"
+	"-m mark ! --mark " __stringify(SOCCR_MARK) " --source %s --sport %d --destination %s --dport %d -j DROP"
 
 static char iptable_cmd_ipv4[] = "iptables";
 static char iptable_cmd_ipv6[] = "ip6tables";
@@ -75,7 +76,7 @@ static int nf_connection_switch_raw(int family, u32 *src_addr, u16 src_port,
 
 	snprintf(buf, sizeof(buf), NF_CONN_CMD, cmd,
 			kdat.has_xtlocks ? "-w" : "",
-			lock ? "-A" : "-D",
+			lock ? "-I" : "-D",
 			input ? "INPUT" : "OUTPUT",
 			dip, (int)dst_port, sip, (int)src_port);
 

@@ -5,20 +5,20 @@
 #include <limits.h>
 #include <sys/resource.h>
 
-#include "compiler.h"
-#include "asm/types.h"
-#include "asm/fpu.h"
-#include "lock.h"
+#include "types.h"
+#include "int.h"
+#include "types.h"
+#include "common/compiler.h"
+#include <compel/asm/fpu.h>
+#include "common/lock.h"
 #include "util.h"
 #include "asm/restorer.h"
-#include "rst_info.h"
 #include "config.h"
-
 #include "posix-timer.h"
 #include "timerfd.h"
 #include "shmem.h"
-#include "sigframe.h"
 #include "parasite-vdso.h"
+#include "fault-injection.h"
 
 #include <time.h>
 
@@ -82,7 +82,6 @@ struct thread_restore_args {
 	UserRegsEntry			gpregs;
 	u64				clear_tid_addr;
 
-	bool				has_futex;
 	u64				futex_rla;
 	u32				futex_rla_len;
 
@@ -108,6 +107,7 @@ struct task_restore_args {
 	int				fd_exe_link;		/* opened self->exe file */
 	int				logfd;
 	unsigned int			loglevel;
+	struct timeval			logstart;
 
 	/* threads restoration */
 	int				nr_threads;		/* number of threads */
@@ -174,12 +174,16 @@ struct task_restore_args {
 
 	int				seccomp_mode;
 
+	bool				compatible_mode;
+
 #ifdef CONFIG_VDSO
 	unsigned long			vdso_rt_size;
 	struct vdso_symtable		vdso_sym_rt;		/* runtime vdso symbols */
 	unsigned long			vdso_rt_parked_at;	/* safe place to keep vdso */
 #endif
 	void				**breakpoint;
+
+	enum faults			fault_strategy;
 } __aligned(64);
 
 /*
@@ -195,13 +199,62 @@ static inline unsigned long restorer_stack(struct restore_mem_zone *mz)
 }
 
 enum {
+	/*
+	 * Restore stages. The stage is started by criu process, then
+	 * confirmed by all tasks involved in it. Then criu does some
+	 * actions and starts the next stage.
+	 *
+	 * The first stated stage is CR_STATE_ROOT_TASK which is started
+	 * right before calling fork_with_pid() for the root_item.
+	 */
 	CR_STATE_FAIL		= -1,
-	CR_STATE_RESTORE_NS	= 0, /* is used for executing "setup-namespace" scripts */
-	CR_STATE_RESTORE_SHARED,
+	/*
+	 * Root task is created and does some pre-checks.
+	 * After the stage ACT_SETUP_NS scripts are performed.
+	 */
+	CR_STATE_ROOT_TASK	= 0,
+	/*
+	 * The prepare_namespace() is called.
+	 * After the stage criu opens root task's mntns and
+	 * calls ACT_POST_SETUP_NS scripts.
+	 */
+	CR_STATE_PREPARE_NAMESPACES,
+	/*
+	 * All tasks fork and call open_transport_socket().
+	 * Stage is needed to make sure they all have the socket.
+	 * Also this stage is a sync point after which the
+	 * fini_restore_mntns() can be called.
+	 *
+	 * This stage is a little bit special. Normally all stages
+	 * are controlled by criu process, but when this stage
+	 * starts criu process starts waiting for the tasks to
+	 * finish it, but by the time it gets woken up the stage
+	 * finished is CR_STATE_RESTORE. The forking stage is
+	 * barrier-ed by the root task, this task is also the one
+	 * that switches the stage (into restoring).
+	 *
+	 * The above is done to lower the amount of context
+	 * switches from root task to criu and back, since the
+	 * separate forking stage is not needed by criu, it's
+	 * purely to make sure all tasks be in sync.
+	 */
 	CR_STATE_FORKING,
+	/*
+	 * Main restore stage. By the end of it all tasks are
+	 * almost ready and what's left is:
+	 *   pick up zombies and helpers
+	 *   restore sigchild handlers used to detect restore errors
+	 *   restore credentials
+	 */
 	CR_STATE_RESTORE,
+	/*
+	 * Tasks restore sigchild handlers.
+	 * Stage is needed to synchronize the change in error
+	 * propagation via sigchild.
+	 */
 	CR_STATE_RESTORE_SIGCHLD,
 	/*
+	 * Final stage.
 	 * For security reason processes can be resumed only when all
 	 * credentials are restored. Otherwise someone can attach to a
 	 * process, which are not restored credentials yet and execute
@@ -218,9 +271,7 @@ enum {
 	})
 
 
-/* the restorer_blob_offset__ prefix is added by gen_offsets.sh */
-#define __blob_offset(name)	restorer_blob_offset__ ## name
-#define _blob_offset(name)	__blob_offset(name)
-#define restorer_sym(rblob, name)	(void*)(rblob + _blob_offset(name))
+#define __r_sym(name)			restorer_sym ## name
+#define restorer_sym(rblob, name)	(void*)(rblob + __r_sym(name))
 
 #endif /* __CR_RESTORER_H__ */

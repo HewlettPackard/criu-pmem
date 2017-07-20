@@ -3,11 +3,11 @@
 
 #include <sys/stat.h>
 
-#include "compiler.h"
-#include "asm/types.h"
+#include "int.h"
+#include "common/compiler.h"
 #include "fcntl.h"
-#include "lock.h"
-#include "list.h"
+#include "common/lock.h"
+#include "common/list.h"
 #include "pid.h"
 #include "rst_info.h"
 
@@ -49,7 +49,7 @@ struct fd_parms {
 	long		fs_type;
 	int		mnt_id;
 
-	struct parasite_ctl *ctl;
+	struct parasite_ctl *fd_ctl;
 };
 
 #define FD_PARMS_INIT			\
@@ -64,15 +64,29 @@ extern int fill_fdlink(int lfd, const struct fd_parms *p, struct fd_link *link);
 
 struct file_desc;
 
+enum {
+	FLE_INITIALIZED,
+	FLE_OPEN,
+	FLE_RESTORED,
+};
+
 struct fdinfo_list_entry {
 	struct list_head	desc_list;	/* To chain on  @fd_info_head */
 	struct file_desc	*desc;		/* Associated file descriptor */
 	struct list_head	ps_list;	/* To chain  per-task files */
-	struct list_head	used_list;	/* To chain per-task used fds */
 	int			pid;
-	futex_t			real_pid;
 	FdinfoEntry		*fe;
+	u8			received:1;
+	u8			stage:3;
 };
+
+static inline void fle_init(struct fdinfo_list_entry *fle, int pid, FdinfoEntry *fe)
+{
+	fle->pid = pid;
+	fle->fe = fe;
+	fle->received = 0;
+	fle->stage = FLE_INITIALIZED;
+}
 
 /* reports whether fd_a takes prio over fd_b */
 static inline int fdinfo_rst_prio(struct fdinfo_list_entry *fd_a, struct fdinfo_list_entry *fd_b)
@@ -89,17 +103,7 @@ struct file_desc_ops {
 	 * The returned descriptor may be closed (dup2-ed to another)
 	 * so it shouldn't be saved for any post-actions.
 	 */
-	int			(*open)(struct file_desc *d);
-	/*
-	 * Called on a file when all files of that type are opened
-	 * and with the fd being the "restored" one.
-	 */
-	int			(*post_open)(struct file_desc *d, int fd);
-	/*
-	 * Report whether the fd in question wants a transport socket
-	 * in it instead of a real file. See file_master for details.
-	 */
-	int			(*want_transport)(FdinfoEntry *fe, struct file_desc *d);
+	int			(*open)(struct file_desc *d, int *new_fd);
 	/*
 	 * Called to collect a new fd before adding it on desc. Clients
 	 * may chose to collect it to some specific rst_info list. See
@@ -110,25 +114,10 @@ struct file_desc_ops {
 	char *			(*name)(struct file_desc *, char *b, size_t s);
 };
 
-static inline void collect_used_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri)
-{
-	struct fdinfo_list_entry *fle;
+void collect_task_fd(struct fdinfo_list_entry *new_fle, struct rst_info *ri);
 
-	list_for_each_entry(fle, &ri->used, used_list) {
-		if (new_fle->fe->fd < fle->fe->fd)
-			break;
-	}
-
-	list_add_tail(&new_fle->used_list, &fle->used_list);
-}
-
-static inline void collect_gen_fd(struct fdinfo_list_entry *fle, struct rst_info *ri)
-{
-	list_add_tail(&fle->ps_list, &ri->fds);
-}
-
-unsigned int find_unused_fd(struct list_head *head, int hint_fd);
-struct fdinfo_list_entry *find_used_fd(struct list_head *head, int fd);
+unsigned int find_unused_fd(struct pstree_item *, int hint_fd);
+struct fdinfo_list_entry *find_used_fd(struct pstree_item *, int fd);
 
 struct file_desc {
 	u32			id;		/* File id, unique */
@@ -158,7 +147,8 @@ extern int file_desc_add(struct file_desc *d, u32 id, struct file_desc_ops *ops)
 extern struct fdinfo_list_entry *file_master(struct file_desc *d);
 extern struct file_desc *find_file_desc_raw(int type, u32 id);
 
-extern int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle, int sock);
+extern int recv_desc_from_peer(struct file_desc *d, int *fd);
+extern int send_desc_to_peer(int fd, struct file_desc *d);
 extern int restore_fown(int fd, FownEntry *fown);
 extern int rst_file_params(int fd, FownEntry *fown, int flags);
 
@@ -191,9 +181,7 @@ extern void inherit_fd_log(void);
 extern int inherit_fd_resolve_clash(int fd);
 extern int inherit_fd_fini(void);
 
-extern bool external_lookup_id(char *id);
 extern int inherit_fd_lookup_id(char *id);
-extern char *external_lookup_by_key(char *id);
 
 extern bool inherited_fd(struct file_desc *, int *fdp);
 
@@ -202,5 +190,7 @@ int dup_fle(struct pstree_item *task, struct fdinfo_list_entry *ple,
 	    int fd, unsigned flags);
 
 extern int open_transport_socket(void);
+extern int set_fds_event(pid_t virt);
+extern void wait_fds_event(void);
 
 #endif /* __CR_FILES_H__ */

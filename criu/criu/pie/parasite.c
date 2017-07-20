@@ -7,26 +7,25 @@
 #include <stdarg.h>
 #include <sys/ioctl.h>
 
-#include "syscall.h"
+#include "int.h"
+#include "types.h"
+#include <compel/plugins/std/syscall.h>
 #include "parasite.h"
 #include "config.h"
 #include "fcntl.h"
 #include "prctl.h"
-#include "lock.h"
+#include "common/lock.h"
 #include "parasite-vdso.h"
-#include "log.h"
+#include "criu-log.h"
 #include "tty.h"
 #include "aio.h"
 
-#include <string.h>
-
-#include "asm/types.h"
 #include "asm/parasite.h"
-#include "asm/restorer.h"
+#include "restorer.h"
+#include "infect-pie.h"
+//#include <string.h>
+//#include <emmintrin.h>
 
-static int tsock = -1;
-
-static struct rt_sigframe *sigframe;
 
 /*
  * PARASITE_CMD_DUMPPAGES is called many times and the parasite args contains
@@ -41,6 +40,8 @@ static struct parasite_dump_pages_args *mprotect_args = NULL;
 #ifndef PR_GET_PDEATHSIG
 #define PR_GET_PDEATHSIG  2
 #endif
+
+
 
 static int mprotect_vmas(struct parasite_dump_pages_args *args)
 {
@@ -66,18 +67,457 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 	return ret;
 }
 
-static int dump_pages(struct parasite_dump_pages_args *args)
+
+
+#if 0
+
+
+#define FLUSH_ALIGN ((uintptr_t)64)
+
+#define ALIGN_MASK	(FLUSH_ALIGN - 1)
+
+#define CHUNK_SIZE	128 /* 16*8 */
+#define CHUNK_SHIFT	7
+#define CHUNK_MASK	(CHUNK_SIZE - 1)
+
+#define DWORD_SIZE	4
+#define DWORD_SHIFT	2
+#define DWORD_MASK	(DWORD_SIZE - 1)
+
+#define MOVNT_SIZE	16
+#define MOVNT_MASK	(MOVNT_SIZE - 1)
+#define MOVNT_SHIFT	4
+
+#define MOVNT_THRESHOLD	256
+
+static size_t  Movnt_threshold = MOVNT_THRESHOLD;
+
+/*
+ ** memmove_nodrain_movnt -- (internal) memmove to pmem without hw drain, movnt
+ **/
+static void *
+memmove_nodrain_movnt(void *pmemdest, const void *src, size_t len)
 {
-	int p, ret;
+//	LOG(15, "pmemdest %p src %p len %zu", pmemdest, src, len);
+
+	__m128i xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7;
+	size_t i;
+	__m128i *d;
+	__m128i *s;
+	void *dest1 = pmemdest;
+	size_t cnt;
+
+	if (len == 0 || src == pmemdest)
+		return pmemdest;
+
+
+	if (len < Movnt_threshold) {
+		while(1) ;
+		return NULL;
+//		memmove(pmemdest, src, len);
+//		pmem_flush(pmemdest, len);
+//		return pmemdest;
+	}
+
+
+	if ((uintptr_t)dest1 - (uintptr_t)src >= len) {
+		/*
+ * 		 * Copy the range in the forward direction.
+ * 		 *
+ * 		 * This is the most common, most optimized case, used unless
+ * 		 * the overlap specifically prevents it.
+ * 		 */
+
+		/* copy up to FLUSH_ALIGN boundary */
+		cnt = (uint64_t)dest1 & ALIGN_MASK;
+		if (cnt > 0) {
+		#if 0
+			cnt = FLUSH_ALIGN - cnt;
+
+			/* never try to copy more the len bytes */
+			if (cnt > len)
+				cnt = len;
+
+			uint8_t *d8 = (uint8_t *)dest1;
+			const uint8_t *s8 = (uint8_t *)src;
+			for (i = 0; i < cnt; i++) {
+				*d8 = *s8;
+				d8++;
+				s8++;
+			}
+			//pmem_flush(dest1, cnt);
+			dest1 = (char *)dest1 + cnt;
+			src = (char *)src + cnt;
+			len -= cnt;
+		#endif
+			while(1) ;
+			return NULL;
+		}
+
+		d = (__m128i *)dest1;
+		s = (__m128i *)src;
+
+		cnt = len >> CHUNK_SHIFT;
+		for (i = 0; i < cnt; i++) {
+
+			xmm0 = _mm_loadu_si128(s);
+			xmm1 = _mm_loadu_si128(s + 1);
+			xmm2 = _mm_loadu_si128(s + 2);
+			xmm3 = _mm_loadu_si128(s + 3);
+			xmm4 = _mm_loadu_si128(s + 4);
+			xmm5 = _mm_loadu_si128(s + 5);
+			xmm6 = _mm_loadu_si128(s + 6);
+			xmm7 = _mm_loadu_si128(s + 7);
+
+			s += 8;
+
+			_mm_stream_si128(d,	xmm0);
+			_mm_stream_si128(d + 1,	xmm1);
+			_mm_stream_si128(d + 2,	xmm2);
+			_mm_stream_si128(d + 3,	xmm3);
+			_mm_stream_si128(d + 4,	xmm4);
+			_mm_stream_si128(d + 5, xmm5);
+			_mm_stream_si128(d + 6,	xmm6);
+			_mm_stream_si128(d + 7,	xmm7);
+
+/*
+			_mm_store_si128(d,	xmm0);
+			_mm_store_si128(d + 1,	xmm1);
+			_mm_store_si128(d + 2,	xmm2);
+			_mm_store_si128(d + 3,	xmm3);
+			_mm_store_si128(d + 4,	xmm4);
+			_mm_store_si128(d + 5,  xmm5);
+			_mm_store_si128(d + 6,	xmm6);
+			_mm_store_si128(d + 7,	xmm7);
+*/
+/*
+			_mm_storeu_si128(d,	xmm0);
+			_mm_storeu_si128(d + 1,	xmm1);
+			_mm_storeu_si128(d + 2,	xmm2);
+			_mm_storeu_si128(d + 3,	xmm3);
+			_mm_storeu_si128(d + 4,	xmm4);
+			_mm_storeu_si128(d + 5,  xmm5);
+			_mm_storeu_si128(d + 6,	xmm6);
+			_mm_storeu_si128(d + 7,	xmm7);
+*/
+	//		VALGRIND_DO_FLUSH(d, 8 * sizeof(*d));
+			d += 8;
+		}
+
+		/* copy the tail (<128 bytes) in 16 bytes chunks */
+		len &= CHUNK_MASK;
+		if (len != 0) {
+		#if 0
+			cnt = len >> MOVNT_SHIFT;
+			for (i = 0; i < cnt; i++) {
+				xmm0 = _mm_loadu_si128(s);
+				_mm_stream_si128(d, xmm0);
+				VALGRIND_DO_FLUSH(d, sizeof(*d));
+				s++;
+				d++;
+			}
+		#endif
+			while(1) ;
+			return NULL;
+		}
+
+		/* copy the last bytes (<16), first dwords then bytes */
+		len &= MOVNT_MASK;
+		if (len != 0) {
+		#if 0
+			cnt = len >> DWORD_SHIFT;
+			int32_t *d32 = (int32_t *)d;
+			int32_t *s32 = (int32_t *)s;
+			for (i = 0; i < cnt; i++) {
+				_mm_stream_si32(d32, *s32);
+				VALGRIND_DO_FLUSH(d32, sizeof(*d32));
+				d32++;
+				s32++;
+			}
+			cnt = len & DWORD_MASK;
+			uint8_t *d8 = (uint8_t *)d32;
+			const uint8_t *s8 = (uint8_t *)s32;
+
+			for (i = 0; i < cnt; i++) {
+				*d8 = *s8;
+				d8++;
+				s8++;
+			}
+			pmem_flush(d32, cnt);
+		#endif
+			while(1) ;
+			return NULL;
+		}
+	} else {
+#if 0
+		/*
+ * 		 * Copy the range in the backward direction.
+ * 		 		 *
+ * 		 		 		 * This prevents overwriting source data due to an
+ * 		 		 		 		 * overlapped destination range.
+ * 		 		 		 		 		 */
+
+		dest1 = (char *)dest1 + len;
+		src = (char *)src + len;
+
+		cnt = (uint64_t)dest1 & ALIGN_MASK;
+		if (cnt > 0) {
+			/* never try to copy more the len bytes */
+			if (cnt > len)
+				cnt = len;
+
+			uint8_t *d8 = (uint8_t *)dest1;
+			const uint8_t *s8 = (uint8_t *)src;
+			for (i = 0; i < cnt; i++) {
+				d8--;
+				s8--;
+				*d8 = *s8;
+			}
+			pmem_flush(d8, cnt);
+			dest1 = (char *)dest1 - cnt;
+			src = (char *)src - cnt;
+			len -= cnt;
+		}
+
+		d = (__m128i *)dest1;
+		s = (__m128i *)src;
+
+		cnt = len >> CHUNK_SHIFT;
+		for (i = 0; i < cnt; i++) {
+			xmm0 = _mm_loadu_si128(s - 1);
+			xmm1 = _mm_loadu_si128(s - 2);
+			xmm2 = _mm_loadu_si128(s - 3);
+			xmm3 = _mm_loadu_si128(s - 4);
+			xmm4 = _mm_loadu_si128(s - 5);
+			xmm5 = _mm_loadu_si128(s - 6);
+			xmm6 = _mm_loadu_si128(s - 7);
+			xmm7 = _mm_loadu_si128(s - 8);
+			s -= 8;
+			_mm_stream_si128(d - 1, xmm0);
+			_mm_stream_si128(d - 2, xmm1);
+			_mm_stream_si128(d - 3, xmm2);
+			_mm_stream_si128(d - 4, xmm3);
+			_mm_stream_si128(d - 5, xmm4);
+			_mm_stream_si128(d - 6, xmm5);
+			_mm_stream_si128(d - 7, xmm6);
+			_mm_stream_si128(d - 8, xmm7);
+			d -= 8;
+			VALGRIND_DO_FLUSH(d, 8 * sizeof(*d));
+		}
+
+		/* copy the tail (<128 bytes) in 16 bytes chunks */
+		len &= CHUNK_MASK;
+		if (len != 0) {
+			cnt = len >> MOVNT_SHIFT;
+			for (i = 0; i < cnt; i++) {
+				d--;
+				s--;
+				xmm0 = _mm_loadu_si128(s);
+				_mm_stream_si128(d, xmm0);
+				VALGRIND_DO_FLUSH(d, sizeof(*d));
+			}
+		}
+
+		/* copy the last bytes (<16), first dwords then bytes */
+		len &= MOVNT_MASK;
+		if (len != 0) {
+			cnt = len >> DWORD_SHIFT;
+			int32_t *d32 = (int32_t *)d;
+			int32_t *s32 = (int32_t *)s;
+			for (i = 0; i < cnt; i++) {
+				d32--;
+				s32--;
+				_mm_stream_si32(d32, *s32);
+				VALGRIND_DO_FLUSH(d32, sizeof(*d32));
+			}
+
+			cnt = len & DWORD_MASK;
+			uint8_t *d8 = (uint8_t *)d32;
+			const uint8_t *s8 = (uint8_t *)s32;
+
+			for (i = 0; i < cnt; i++) {
+				d8--;
+				s8--;
+				*d8 = *s8;
+			}
+			pmem_flush(d8, cnt);
+		}
+	#endif
+		while(1) ;
+		return NULL;
+	}
+
+	/* serialize non-temporal store instructions */
+	//
+	//predrain_fence_sfence();
+
+	//_mm_sfence();
+
+	return pmemdest;
+}
+
+#endif
+
+#if 0
+
+static int dump_pages_nvm(struct parasite_dump_pages_args *args)
+{
+	int ret;
+	int i, count = 14;
+	void *fileaddr; // to munmap
+	void *addr; // to memcpy
+	struct iovec *iovs;
+	//void *ptr;
+//	char str1[16] = "I am here, 4!";
+
+
+	// fallocate and mmap file here, after memcpy, munmap the file
+
+	// 1. fallocate file with exact file size
+	ret = sys_fallocate(args->fd, 0, args->file_offset*PAGE_SIZE, args->pages*PAGE_SIZE);
+	if(ret != 0)
+		return -1;
+
+
+	// 2. mmap file
+	fileaddr = (char *)sys_mmap(0, args->pages*PAGE_SIZE, PROT_WRITE, 
+			MAP_SHARED, args->fd, args->file_offset*PAGE_SIZE);
+	args->pmemaddr = fileaddr;
+	addr = fileaddr;
+
+	if(fileaddr == MAP_FAILED){
+		sys_close(args->fd);
+		pr_err("mmap");
+		return -1;
+	}
+
+	// 3. Close file
+	if(args->is_last == true)
+		sys_close(args->fd);
+
+	// Get IO vects info
+	iovs = pargs_iovs(args);
+
+//	if(count > args->segs)
+//		count = args->segs;
+
+	// 4. copy to NVM here
+	for(i = 0; i < args->segs; i++){
+
+		//normal memcpy
+		memcpy(addr, iovs[args->seg_off+i].iov_base, iovs[args->seg_off+i].iov_len);
+
+		// nt-store
+//		ptr = memmove_nodrain_movnt(addr, iovs[args->seg_off+i].iov_base, iovs[args->seg_off+i].iov_len);
+
+	//	if(ptr == NULL){
+	//		pr_err("memmove");
+	//		return -1;
+	//	}
+/*
+		if(i < count){
+			args->addrs[i] = iovs[args->seg_off+i].iov_base;
+			args->len[i] = iovs[args->seg_off+i].iov_len;
+		}
+*/
+		addr += iovs[args->seg_off+i].iov_len;
+	}
+
+	// 5. mummap here
+	ret = sys_munmap(fileaddr, args->pages*PAGE_SIZE);
+	if(ret == -1){
+		pr_err("munmap");
+		return -1;
+	}
+
+	return 0;
+}
+
+#endif
+
+
+static int dump_pages_nvm(struct parasite_dump_pages_args *args)
+{
+	ssize_t ret;
+//	ssize_t total;
+//	int i;
+//	int count = 14;
 	struct iovec *iovs;
 
+
+	// get IO vectors info
+	iovs = pargs_iovs(args);
+
+	//if(count > args->segs)
+	//	count = args->segs;
+
+	// write to file
+
+	ret = sys_writev(args->fd, &iovs[args->seg_off], args->segs);
+
+#if 0
+	total = 0;
+	for(i = 0; i < args->segs; i++){
+
+	//	ret = sys_write(args->fd, iovs[args->seg_off+i].iov_base, iovs[args->seg_off+i].iov_len);
+
+		total +=  iovs[args->seg_off+i].iov_len;
+/*
+		if(ret != iovs[args->seg_off+i].iov_len){
+			pr_err("write");
+			return -1;
+		}
+*/
+/*
+		if(i < count){
+			args->addrs[i] = iovs[args->seg_off+i].iov_base;
+			args->len[i] = iovs[args->seg_off+i].iov_len;
+		}
+*/
+	}
+
+#endif
+
+	if(ret != args->pages*PAGE_SIZE){
+//		args->a = ret;
+//		args->b = total;
+		pr_err("writev");
+		return -1;
+	}
+
+	// Close file for the last write
+	if(args->is_last == true)
+		sys_close(args->fd);
+
+	return 0;
+}
+
+
+static int dump_pages(struct parasite_dump_pages_args *args)
+{
+	int p, ret, tsock;
+	struct iovec *iovs;
+//	int count = 14, i;
+
+	tsock = parasite_get_rpc_sock();
 	p = recv_fd(tsock);
 	if (p < 0)
 		return -1;
 
 	iovs = pargs_iovs(args);
+
 	ret = sys_vmsplice(p, &iovs[args->off], args->nr_segs,
 				SPLICE_F_GIFT | SPLICE_F_NONBLOCK);
+
+/*
+	if(count > args->nr_segs)
+		count = args->nr_segs;
+
+	for(i = 0; i < count; i++){
+		args->addrs[i] = iovs[args->off+i].iov_base;
+		args->len[i] = iovs[args->off+i].iov_len;
+	}
+*/
 	if (ret != PAGE_SIZE * args->nr_pages) {
 		sys_close(p);
 		pr_err("Can't splice pages to pipe (%d/%d)\n", ret, args->nr_pages);
@@ -87,6 +527,7 @@ static int dump_pages(struct parasite_dump_pages_args *args)
 	sys_close(p);
 	return 0;
 }
+
 
 static int dump_sigact(struct parasite_dump_sa_args *da)
 {
@@ -276,12 +717,71 @@ grps_err:
 	return -1;
 }
 
+static int fill_fds_opts(struct parasite_drain_fd *fds, struct fd_opts *opts)
+{
+	int i;
+
+	for (i = 0; i < fds->nr_fds; i++) {
+		int flags, fd = fds->fds[i], ret;
+		struct fd_opts *p = opts + i;
+		struct f_owner_ex owner_ex;
+		uint32_t v[2];
+
+		flags = sys_fcntl(fd, F_GETFD, 0);
+		if (flags < 0) {
+			pr_err("fcntl(%d, F_GETFD) -> %d\n", fd, flags);
+			return -1;
+		}
+
+		p->flags = (char)flags;
+
+		ret = sys_fcntl(fd, F_GETOWN_EX, (long)&owner_ex);
+		if (ret) {
+			pr_err("fcntl(%d, F_GETOWN_EX) -> %d\n", fd, ret);
+			return -1;
+		}
+
+		/*
+		 * Simple case -- nothing is changed.
+		 */
+		if (owner_ex.pid == 0) {
+			p->fown.pid = 0;
+			continue;
+		}
+
+		ret = sys_fcntl(fd, F_GETOWNER_UIDS, (long)&v);
+		if (ret) {
+			pr_err("fcntl(%d, F_GETOWNER_UIDS) -> %d\n", fd, ret);
+			return -1;
+		}
+
+		p->fown.uid	 = v[0];
+		p->fown.euid	 = v[1];
+		p->fown.pid_type = owner_ex.type;
+		p->fown.pid	 = owner_ex.pid;
+	}
+
+	return 0;
+}
+
 static int drain_fds(struct parasite_drain_fd *args)
 {
-	int ret;
+	int ret, tsock;
+	struct fd_opts *opts;
 
+	/*
+	 * See the drain_fds_size() in criu code, the memory
+	 * for this args is ensured to be large enough to keep
+	 * an array of fd_opts at the tail.
+	 */
+	opts = ((void *)args) + sizeof(*args) + args->nr_fds * sizeof(args->fds[0]);
+	ret = fill_fds_opts(args, opts);
+	if (ret)
+		return ret;
+
+	tsock = parasite_get_rpc_sock();
 	ret = send_fds(tsock, NULL, 0,
-		       args->fds, args->nr_fds, true);
+		       args->fds, args->nr_fds, opts, sizeof(struct fd_opts));
 	if (ret)
 		pr_err("send_fds failed (%d)\n", ret);
 
@@ -309,7 +809,7 @@ static int pie_atoi(char *str)
 	return ret;
 }
 
-static int get_proc_fd()
+static int get_proc_fd(void)
 {
 	int ret;
 	char buf[11];
@@ -346,9 +846,9 @@ static int get_proc_fd()
 	return open_detach_mount(proc_mountpoint);
 }
 
-static int parasite_get_proc_fd()
+static int parasite_get_proc_fd(void)
 {
-	int fd, ret;
+	int fd, ret, tsock;
 
 	fd = get_proc_fd();
 	if (fd < 0) {
@@ -356,6 +856,7 @@ static int parasite_get_proc_fd()
 		return -1;
 	}
 
+	tsock = parasite_get_rpc_sock();
 	ret = send_fd(tsock, NULL, 0, fd);
 	sys_close(fd);
 	return ret;
@@ -559,229 +1060,75 @@ static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
 	return 0;
 }
 
-static int __parasite_daemon_reply_ack(unsigned int cmd, int err)
+void parasite_cleanup(void)
 {
-	struct ctl_msg m;
-	int ret;
-
-	m = ctl_msg_ack(cmd, err);
-	ret = sys_sendto(tsock, &m, sizeof(m), 0, NULL, 0);
-	if (ret != sizeof(m)) {
-		pr_err("Sent only %d bytes while %zu expected\n", ret, sizeof(m));
-		return -1;
-	}
-
-	pr_debug("__sent ack msg: %d %d %d\n",
-		 m.cmd, m.ack, m.err);
-
-	return 0;
-}
-
-static int __parasite_daemon_wait_msg(struct ctl_msg *m)
-{
-	int ret;
-
-	pr_debug("Daemon waits for command\n");
-
-	while (1) {
-		*m = (struct ctl_msg){ };
-		ret = sys_recvfrom(tsock, m, sizeof(*m), MSG_WAITALL, NULL, 0);
-		if (ret != sizeof(*m)) {
-			pr_err("Trimmed message received (%d/%d)\n",
-			       (int)sizeof(*m), ret);
-			return -1;
-		}
-
-		pr_debug("__fetched msg: %d %d %d\n",
-			 m->cmd, m->ack, m->err);
-		return 0;
-	}
-
-	return -1;
-}
-
-static noinline void fini_sigreturn(unsigned long new_sp)
-{
-	ARCH_RT_SIGRETURN(new_sp);
-}
-
-static int fini()
-{
-	unsigned long new_sp;
-
 	if (mprotect_args) {
 		mprotect_args->add_prot = 0;
 		mprotect_vmas(mprotect_args);
 	}
-
-	new_sp = (long)sigframe + RT_SIGFRAME_OFFSET(sigframe);
-	pr_debug("%ld: new_sp=%lx ip %lx\n", sys_gettid(),
-		  new_sp, RT_SIGFRAME_REGIP(sigframe));
-
-	sys_close(tsock);
-	log_set_fd(-1);
-
-	fini_sigreturn(new_sp);
-
-	BUG();
-
-	return -1;
 }
 
-static noinline __used int noinline parasite_daemon(void *args)
+int parasite_daemon_cmd(int cmd, void *args)
 {
-	struct ctl_msg m = { };
-	int ret = -1;
-
-	pr_debug("Running daemon thread leader\n");
-
-	/* Reply we're alive */
-	if (__parasite_daemon_reply_ack(PARASITE_CMD_INIT_DAEMON, 0))
-		goto out;
-
-	ret = 0;
-
-	while (1) {
-		if (__parasite_daemon_wait_msg(&m))
-			break;
-
-		if (ret && m.cmd != PARASITE_CMD_FINI) {
-			pr_err("Command rejected\n");
-			continue;
-		}
-
-		switch (m.cmd) {
-		case PARASITE_CMD_FINI:
-			goto out;
-		case PARASITE_CMD_DUMPPAGES:
-			ret = dump_pages(args);
-			break;
-		case PARASITE_CMD_MPROTECT_VMAS:
-			ret = mprotect_vmas(args);
-			break;
-		case PARASITE_CMD_DUMP_SIGACTS:
-			ret = dump_sigact(args);
-			break;
-		case PARASITE_CMD_DUMP_ITIMERS:
-			ret = dump_itimers(args);
-			break;
-		case PARASITE_CMD_DUMP_POSIX_TIMERS:
-			ret = dump_posix_timers(args);
-			break;
-		case PARASITE_CMD_DUMP_THREAD:
-			ret = dump_thread(args);
-			break;
-		case PARASITE_CMD_DUMP_MISC:
-			ret = dump_misc(args);
-			break;
-		case PARASITE_CMD_DRAIN_FDS:
-			ret = drain_fds(args);
-			break;
-		case PARASITE_CMD_GET_PROC_FD:
-			ret = parasite_get_proc_fd();
-			break;
-		case PARASITE_CMD_DUMP_TTY:
-			ret = parasite_dump_tty(args);
-			break;
-		case PARASITE_CMD_CHECK_AIOS:
-			ret = parasite_check_aios(args);
-			break;
-		case PARASITE_CMD_CHECK_VDSO_MARK:
-			ret = parasite_check_vdso_mark(args);
-			break;
-		case PARASITE_CMD_DUMP_CGROUP:
-			ret = parasite_dump_cgroup(args);
-			break;
-		default:
-			pr_err("Unknown command in parasite daemon thread leader: %d\n", m.cmd);
-			ret = -1;
-			break;
-		}
-
-		if (__parasite_daemon_reply_ack(m.cmd, ret))
-			break;
-
-		if (ret) {
-			pr_err("Close the control socket for writing\n");
-			sys_shutdown(tsock, SHUT_WR);
-		}
-	}
-
-out:
-	fini();
-
-	return 0;
-}
-
-static noinline int unmap_itself(void *data)
-{
-	struct parasite_unmap_args *args = data;
-
-	sys_munmap(args->parasite_start, args->parasite_len);
-	/*
-	 * This call to sys_munmap must never return. Instead, the controlling
-	 * process must trap us on the exit from munmap.
-	 */
-
-	BUG();
-	return -1;
-}
-
-static noinline __used int parasite_init_daemon(void *data)
-{
-	struct parasite_init_args *args = data;
 	int ret;
 
-	args->sigreturn_addr = fini_sigreturn;
-	sigframe = args->sigframe;
-
-	ret = tsock = sys_socket(PF_UNIX, SOCK_SEQPACKET, 0);
-	if (tsock < 0) {
-		pr_err("Can't create socket: %d\n", tsock);
-		goto err;
+	switch (cmd) {
+	case PARASITE_CMD_DUMPPAGES:
+		ret = dump_pages(args);
+		break;
+	case PARASITE_CMD_DUMPPAGES_NVM:
+		ret = dump_pages_nvm(args);
+		break;
+	case PARASITE_CMD_MPROTECT_VMAS:
+		ret = mprotect_vmas(args);
+		break;
+	case PARASITE_CMD_DUMP_SIGACTS:
+		ret = dump_sigact(args);
+		break;
+	case PARASITE_CMD_DUMP_ITIMERS:
+		ret = dump_itimers(args);
+		break;
+	case PARASITE_CMD_DUMP_POSIX_TIMERS:
+		ret = dump_posix_timers(args);
+		break;
+	case PARASITE_CMD_DUMP_THREAD:
+		ret = dump_thread(args);
+		break;
+	case PARASITE_CMD_DUMP_MISC:
+		ret = dump_misc(args);
+		break;
+	case PARASITE_CMD_DRAIN_FDS:
+		ret = drain_fds(args);
+		break;
+	case PARASITE_CMD_GET_PROC_FD:
+		ret = parasite_get_proc_fd();
+		break;
+	case PARASITE_CMD_DUMP_TTY:
+		ret = parasite_dump_tty(args);
+		break;
+	case PARASITE_CMD_CHECK_AIOS:
+		ret = parasite_check_aios(args);
+		break;
+	case PARASITE_CMD_CHECK_VDSO_MARK:
+		ret = parasite_check_vdso_mark(args);
+		break;
+	case PARASITE_CMD_DUMP_CGROUP:
+		ret = parasite_dump_cgroup(args);
+		break;
+	default:
+		pr_err("Unknown command in parasite daemon thread leader: %d\n", cmd);
+		ret = -1;
+		break;
 	}
 
-	ret = sys_connect(tsock, (struct sockaddr *)&args->h_addr, args->h_addr_len);
-	if (ret < 0) {
-		pr_err("Can't connect the control socket\n");
-		goto err;
-	}
-
-	futex_set_and_wake(&args->daemon_connected, 1);
-
-	ret = recv_fd(tsock);
-	if (ret >= 0) {
-		log_set_fd(ret);
-		log_set_loglevel(args->log_level);
-		ret = 0;
-	} else
-		goto err;
-
-	parasite_daemon(data);
-
-err:
-	futex_set_and_wake(&args->daemon_connected, ret);
-	fini();
-	BUG();
-
-	return -1;
+	return ret;
 }
 
-#ifndef __parasite_entry
-# define __parasite_entry
-#endif
-
-int __used __parasite_entry parasite_service(unsigned int cmd, void *args)
+int parasite_trap_cmd(int cmd, void *args)
 {
-	pr_info("Parasite cmd %d/%x process\n", cmd, cmd);
-
 	switch (cmd) {
 	case PARASITE_CMD_DUMP_THREAD:
 		return dump_thread(args);
-	case PARASITE_CMD_INIT_DAEMON:
-		return parasite_init_daemon(args);
-	case PARASITE_CMD_UNMAP:
-		return unmap_itself(args);
 	}
 
 	pr_err("Unknown command to parasite: %d\n", cmd);

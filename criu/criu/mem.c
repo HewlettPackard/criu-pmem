@@ -3,7 +3,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
-
+#include "types.h"
 #include "cr_options.h"
 #include "servicefd.h"
 #include "mem.h"
@@ -24,9 +24,77 @@
 #include "files-reg.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
-
+#include "infect.h"
+#include <compel/compel.h>
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+#include "crtools.h"
+#include <sys/time.h>
+
+
+
+//#define DBG
+
+
+
+//#define TEST
+
+
+#define  PATH1  "pages-101.img"
+#define  PATH2  "pages-102.img"
+
+//#define  PATH1  "pages-1.img"
+//#define  PATH2  "pages-2.img"
+
+// Jay
+static int prepare_img_path(struct page_xfer *xfer)
+{
+	unsigned int len, len1, len2;
+	char *pages_path;
+#ifdef TEST
+	static int count = 0;
+#endif
+
+	//printf("gg\n");
+	//printf("%s\n", xfer->pi->page_img_path);
+
+	//printf("bb\n");
+
+	if(xfer->pi->page_img_path == NULL)
+		assert(0);
+
+	len1 = strlen(get_current_dir_name()); 
+#ifdef  TEST
+	if(count == 0)
+		len2 = strlen(PATH1); 
+	else
+		len2 = strlen(PATH2); 
+#else
+	len2 = strlen(xfer->pi->page_img_path); 
+#endif
+	len = len1 + len2+ 2; // +1 for null-terminator, +1 for /
+
+	pages_path = malloc(len);
+	memcpy(pages_path, get_current_dir_name(), len1);
+	pages_path[len1] = '/';
+
+#ifdef  TEST
+	if(count == 0)
+		memcpy(pages_path+len1+1, PATH1, len2+1);
+	else
+		memcpy(pages_path+len1+1, PATH2, len2+1);
+	count++;
+#else
+	memcpy(pages_path+len1+1, xfer->pi->page_img_path, len2+1);
+	free(xfer->pi->page_img_path);
+#endif
+
+	xfer->pi->page_img_path = pages_path;
+	
+//	printf("pages image file path n prepare_image_path is: %s\n", xfer->pi->page_img_path);
+	return 0;
+}
+
 
 static int task_reset_dirty_track(int pid)
 {
@@ -55,22 +123,22 @@ int do_task_reset_dirty_track(int pid)
 
 	ret = write(fd, cmd, sizeof(cmd));
 	if (ret < 0) {
-               if (errno == EINVAL) /* No clear-soft-dirty in kernel */
-                       ret = 1;
-               else {
-                       pr_perror("Can't reset %d's dirty memory tracker (%d)", pid, errno);
-                       ret = -1;
-               }
-       } else {
-               pr_info(" ... done\n");
-               ret = 0;
+		if (errno == EINVAL) /* No clear-soft-dirty in kernel */
+			ret = 1;
+		else {
+			pr_perror("Can't reset %d's dirty memory tracker (%d)", pid, errno);
+			ret = -1;
+		}
+	} else {
+		pr_info(" ... done\n");
+		ret = 0;
 	}
 
-       close(fd);
-       return ret;
+	close(fd);
+	return ret;
 }
 
-unsigned int dump_pages_args_size(struct vm_area_list *vmas)
+unsigned long dump_pages_args_size(struct vm_area_list *vmas)
 {
 	/* In the worst case I need one iovec for each page */
 	return sizeof(struct parasite_dump_pages_args) +
@@ -132,13 +200,19 @@ bool page_in_parent(bool dirty)
  * the memory contents is present in the pagent image set.
  */
 
-static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off, bool has_parent)
+
+
+static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off, bool has_parent, bool pre_dump)
 {
 	u64 *at = &map[PAGE_PFN(*off)];
 	unsigned long pfn, nr_to_scan;
 	unsigned long pages[2] = {};
 
 	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
+
+	//printf("nr_to_scan: %lu\n", nr_to_scan);
+
+	//nr_to_scan is much larger than that of dumped pages
 
 	for (pfn = 0; pfn < nr_to_scan; pfn++) {
 		unsigned long vaddr;
@@ -160,7 +234,7 @@ static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u
 			ret = page_pipe_add_hole(pp, vaddr);
 			pages[0]++;
 		} else {
-			ret = page_pipe_add_page(pp, vaddr);
+			ret = page_pipe_add_page(pp, vaddr, pre_dump);
 			pages[1]++;
 		}
 
@@ -177,17 +251,20 @@ static int generate_iovs(struct vma_area *vma, struct page_pipe *pp, u64 *map, u
 	cnt_add(CNT_PAGES_WRITTEN, pages[1]);
 
 	pr_info("Pagemap generated: %lu pages %lu holes\n", pages[1], pages[0]);
+	
+//	if((pages[1] != 0)||(pages[0] != 0))
+//		printf("Pagemap generated: %lu pages %lu holes in generate_iovs\n", pages[1], pages[0]);
 	return 0;
 }
 
 static struct parasite_dump_pages_args *prep_dump_pages_args(struct parasite_ctl *ctl,
-		struct vm_area_list *vma_area_list, bool delayed_dump)
+		struct vm_area_list *vma_area_list, bool skip_non_trackable)
 {
 	struct parasite_dump_pages_args *args;
 	struct parasite_vma_entry *p_vma;
 	struct vma_area *vma;
 
-	args = parasite_args_s(ctl, dump_pages_args_size(vma_area_list));
+	args = compel_parasite_args_s(ctl, dump_pages_args_size(vma_area_list));
 
 	p_vma = pargs_vmas(args);
 	args->nr_vmas = 0;
@@ -199,7 +276,7 @@ static struct parasite_dump_pages_args *prep_dump_pages_args(struct parasite_ctl
 		 * Kernel write to aio ring is not soft-dirty tracked,
 		 * so we ignore them at pre-dump.
 		 */
-		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && delayed_dump)
+		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && skip_non_trackable)
 			continue;
 		if (vma->e->prot & PROT_READ)
 			continue;
@@ -215,11 +292,69 @@ static struct parasite_dump_pages_args *prep_dump_pages_args(struct parasite_ctl
 	return args;
 }
 
-static int dump_pages(struct page_pipe *pp, struct parasite_ctl *ctl,
-			struct parasite_dump_pages_args *args, struct page_xfer *xfer)
+
+static int drain_dump_pages_nvm(struct page_pipe *pp, struct parasite_ctl *ctl,
+		      struct parasite_dump_pages_args *args, bool pre_dump)
+{
+	int ret = 0;
+#ifdef DBG
+	int count = 14;
+
+
+
+	printf("fd: %d\n", args->fd);
+	printf("pages image file path is: %s\n", args->pathname);
+	printf("pages: %d, segs: %d\n", args->pages, args->segs);
+	printf("Drain pp nvm: %d pages %d segs %d off in drain_pages_nvm() in mem.c\n",
+		args->pages, args->segs, args->seg_off);
+#endif
+	pr_debug("drain pp nvm: %d pages %d segs %d off\n",
+			args->pages, args->segs, args->seg_off);
+
+
+
+	if((pre_dump == true)||(opts.use_pmem == false))
+		assert(0);
+
+	/* step 2 and 3: drain and dump pages to NVM directly */
+	ret = compel_rpc_call_sync(PARASITE_CMD_DUMPPAGES_NVM, ctl);
+
+	if (ret < 0){
+		printf("Cannot write the whole image\n");
+		return -1;
+	}
+
+	//args->file_offset += args->pages;
+
+//	printf("seg off %d\n", args->seg_off);
+	args->seg_off += args->segs;
+
+#ifdef DBG
+	if(count > args->segs)
+		count = args->segs;
+
+	for(int i = 0; i < count; i++){
+		printf("addr: %p, len: %lu\n", args->addrs[i], args->len[i]);
+	}
+
+	printf("pmemaddr: %p\n", args->pmemaddr);	
+#endif
+
+	return 0;
+}
+
+
+// used only in predump for now
+static int drain_pages(struct page_pipe *pp, struct parasite_ctl *ctl,
+		      struct parasite_dump_pages_args *args, bool pre_dump)
 {
 	struct page_pipe_buf *ppb;
 	int ret = 0;
+
+
+	// should be called at predump only
+	if((pre_dump == false)&&(opts.use_pmem == true))
+		assert(0);
 
 	debug_show_page_pipe(pp);
 
@@ -227,40 +362,64 @@ static int dump_pages(struct page_pipe *pp, struct parasite_ctl *ctl,
 	list_for_each_entry(ppb, &pp->bufs, l) {
 		args->nr_segs = ppb->nr_segs;
 		args->nr_pages = ppb->pages_in;
+
 		pr_debug("PPB: %d pages %d segs %u pipe %d off\n",
 				args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
 
-		ret = __parasite_execute_daemon(PARASITE_CMD_DUMPPAGES, ctl);
+#ifdef  DBG
+		printf("PPB: %d pages %d segs %u pipe %d off in drain_pages() in mem.c\n",
+				args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
+#endif
+
+		ret = compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			return -1;
-		ret = parasite_send_fd(ctl, ppb->p[1]);
+
+		ret = compel_util_send_fd(ctl, ppb->p[1]);
 		if (ret)
 			return -1;
 
-		ret = __parasite_wait_daemon_ack(PARASITE_CMD_DUMPPAGES, ctl);
+		ret = compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl);
 		if (ret < 0)
 			return -1;
 
 		args->off += args->nr_segs;
 	}
 
+	return 0;
+}
+
+
+static int xfer_pages(struct page_pipe *pp, struct page_xfer *xfer, bool pre_dump)
+{
+	int ret;
+	bool write_bypass;
+
+
+
+
+	if((opts.use_pmem == true)&&(pre_dump == false))
+		write_bypass = true;
+	else
+		write_bypass = false;
+
 	/*
 	 * Step 3 -- write pages into image (or delay writing for
 	 *           pre-dump action (see pre_dump_one_task)
 	 */
-	if (xfer) {
-		timing_start(TIME_MEMWRITE);
-		ret = page_xfer_dump_pages(xfer, pp, 0);
-		timing_stop(TIME_MEMWRITE);
-	}
+	timing_start(TIME_MEMWRITE);
+	ret = page_xfer_dump_pages(xfer, pp, 0, write_bypass);
+	timing_stop(TIME_MEMWRITE);
 
 	return ret;
 }
 
-static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
+
+static int __parasite_dump_pages_seized(struct pstree_item *item,
 		struct parasite_dump_pages_args *args,
 		struct vm_area_list *vma_area_list,
-		bool delayed_dump)
+		struct mem_dump_ctl *mdc,
+		struct parasite_ctl *ctl)
 {
 	pmc_t pmc = PMC_INIT;
 	struct page_pipe *pp;
@@ -269,14 +428,24 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	int ret = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
+	//jay
+	struct page_pipe_buf *ppb;
+	unsigned int nr_pages, nr_segs;
+//	struct timeval t1, t2, t3, t4;
+//	unsigned long timecost;
+
+
 
 	pr_info("\n");
-	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, ctl->pid.real);
+	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
 	pr_info("----------------------------------------\n");
+
+
+//	gettimeofday(&t1, NULL);
 
 	timing_start(TIME_MEMDUMP);
 
-	pr_debug("   Private vmas %lu/%lu pages\n",
+	pr_debug("Private vmas %lu/%lu pages\n",
 			vma_area_list->priv_longest, vma_area_list->priv_size);
 
 	/*
@@ -285,24 +454,51 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 
 	pmc_size = max(vma_area_list->priv_longest,
 		vma_area_list->shared_longest);
-	if (pmc_init(&pmc, ctl->pid.real, &vma_area_list->h,
+	if (pmc_init(&pmc, item->pid->real, &vma_area_list->h,
 			 pmc_size * PAGE_SIZE))
 		return -1;
 
 	ret = -1;
-	if (!delayed_dump)
+	if (!mdc->pre_dump){
+		/*
+		 * Chunk mode pushes pages portion by portion. This mode
+		 * only works when we don't need to keep pp for later
+		 * use, i.e. on non-lazy non-predump.
+		 */
 		cpp_flags |= PP_CHUNK_MODE;
-	ctl->mem_pp = pp = create_page_pipe(vma_area_list->priv_size,
+	}
+
+	pp = create_page_pipe(vma_area_list->priv_size,
 					    pargs_iovs(args), cpp_flags);
 	if (!pp)
 		goto out;
-
-	if (!delayed_dump) {
-		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, ctl->pid.virt);
+	if (!mdc->pre_dump) {
+		/*
+		 * Regular dump -- create xfer object and send pages to it
+		 * right here. For pre-dumps the pp will be taken by the
+		 * caller and handled later.
+		 */
+		// create 2 image files here if not predump
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item), false);
 		if (ret < 0)
 			goto out_pp;
+
+		// Jay
+		if(opts.use_pmem == true){
+			// Generate the page image path
+			prepare_img_path(&xfer);
+			args->pathname = xfer.pi->page_img_path;
+	
+			// get fd for pages-x.img
+			args->fd = vma_area_list->fd;	
+			if(args->fd == -1)
+				assert(0);
+			//args->file_offset = 0;
+			args->is_last = false;
+			args->seg_off = 0;
+		}
 	} else {
-		ret = check_parent_page_xfer(CR_FD_PAGEMAP, ctl->pid.virt);
+		ret = check_parent_page_xfer(CR_FD_PAGEMAP, vpid(item));
 		if (ret < 0)
 			goto out_pp;
 
@@ -318,12 +514,12 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 		bool has_parent = !!xfer.parent;
 		u64 off = 0;
 		u64 *map;
-
+	
 		if (!vma_area_is_private(vma_area, kdat.task_size) &&
 				!vma_area_is(vma_area, VMA_ANON_SHARED))
 			continue;
 		if (vma_entry_is(vma_area->e, VMA_AREA_AIORING)) {
-			if (delayed_dump)
+			if (mdc->pre_dump)
 				continue;
 			has_parent = false;
 		}
@@ -331,16 +527,45 @@ static int __parasite_dump_pages_seized(struct parasite_ctl *ctl,
 		map = pmc_get_map(&pmc, vma_area);
 		if (!map)
 			goto out_xfer;
-		if (vma_area_is(vma_area, VMA_ANON_SHARED))
-			ret = add_shmem_area(ctl->pid.real, vma_area->e, map);
+		if (vma_area_is(vma_area, VMA_ANON_SHARED)){
+			ret = add_shmem_area(item->pid->real, vma_area->e, map);
+		}
 		else {
 again:
-			ret = generate_iovs(vma_area, pp, map, &off,
-				has_parent);
-			if (ret == -EAGAIN) {
-				BUG_ON(delayed_dump);
 
-				ret = dump_pages(pp, ctl, args, &xfer);
+			// One vma area calls once
+			ret = generate_iovs(vma_area, pp, map, &off, has_parent, mdc->pre_dump);
+
+			if (ret == -EAGAIN) {
+				// Normal case? Yes! for the processes having huge VMAs
+				BUG_ON(!(pp->flags & PP_CHUNK_MODE));
+
+				if(opts.use_pmem == true){
+					// We have iovs, so open pmem here since we know length of ivo_len
+					nr_pages = 0;
+					nr_segs = 0;
+
+					// add all pages in each page pipe!!
+					list_for_each_entry(ppb, &pp->bufs, l) {
+						nr_pages += ppb->pages_in;
+						nr_segs+= ppb->nr_segs;
+					}
+				#ifdef DBG
+					printf("nr_pages is %d and nr_segs is %d\n", nr_pages, nr_segs);
+				#endif
+					args->pages = nr_pages;
+					args->segs = nr_segs;
+
+					ret = drain_dump_pages_nvm(pp, ctl, args, mdc->pre_dump);
+
+			#ifdef TEST
+					ret = drain_pages(pp, ctl, args, mdc->pre_dump);
+			#endif
+				}else{
+					ret = drain_pages(pp, ctl, args, mdc->pre_dump);
+				}
+				if (!ret)
+					ret = xfer_pages(pp, &xfer, mdc->pre_dump);
 				if (!ret) {
 					page_pipe_reinit(pp);
 					goto again;
@@ -351,7 +576,40 @@ again:
 			goto out_xfer;
 	}
 
-	ret = dump_pages(pp, ctl, args, delayed_dump ? NULL : &xfer);
+	//Jay
+	if((opts.use_pmem == true)&&(mdc->pre_dump == false)){
+
+		// We have iovs, so open pmem here since we know length of ivo_len
+		nr_pages = 0;
+		nr_segs = 0;
+
+		// add all pages in each page pipe!!
+		list_for_each_entry(ppb, &pp->bufs, l) {
+			nr_pages += ppb->pages_in;
+			nr_segs+= ppb->nr_segs;
+		}
+#ifdef DBG
+		printf("nr_pages is %d and nr_segs is %d\n", nr_pages, nr_segs);
+#endif
+
+		args->pages = nr_pages;
+		args->segs = nr_segs;
+		args->is_last = true;
+		ret = drain_dump_pages_nvm(pp, ctl, args, mdc->pre_dump);
+
+	#ifdef TEST
+		ret = drain_pages(pp, ctl, args, mdc->pre_dump);
+	#endif
+	}
+	else{
+		// vmsplice() in parasite
+		ret = drain_pages(pp, ctl, args, mdc->pre_dump);
+	}
+
+	if (!ret && !mdc->pre_dump){
+		// Important! write pagemap here!
+		ret = xfer_pages(pp, &xfer, mdc->pre_dump);
+	}
 	if (ret)
 		goto out_xfer;
 
@@ -360,27 +618,40 @@ again:
 	/*
 	 * Step 4 -- clean up
 	 */
-
-	ret = task_reset_dirty_track(ctl->pid.real);
+	ret = task_reset_dirty_track(item->pid->real);
 out_xfer:
-	if (!delayed_dump)
+	if (!mdc->pre_dump)
 		xfer.close(&xfer);
 out_pp:
-	if (ret || !delayed_dump)
+	if (ret || !mdc->pre_dump)
 		destroy_page_pipe(pp);
+	else
+		dmpi(item)->mem_pp = pp;
 out:
 	pmc_fini(&pmc);
 	pr_info("----------------------------------------\n");
+	// Jay
+	if((opts.use_pmem == true)&&(mdc->pre_dump == false))
+		free(args->pathname);
+/*
+	gettimeofday(&t2, NULL);
+	timecost = (t2.tv_sec - t1.tv_sec)*1000000 + (t2.tv_usec-t1.tv_usec);
+        printf("time spent is %lu\n", timecost);
+*/
+
 	return ret;
 }
 
-int parasite_dump_pages_seized(struct parasite_ctl *ctl,
-		struct vm_area_list *vma_area_list, bool delayed_dump)
+
+int parasite_dump_pages_seized(struct pstree_item *item,
+		struct vm_area_list *vma_area_list,
+		struct mem_dump_ctl *mdc,
+		struct parasite_ctl *ctl)
 {
 	int ret;
 	struct parasite_dump_pages_args *pargs;
 
-	pargs = prep_dump_pages_args(ctl, vma_area_list, delayed_dump);
+	pargs = prep_dump_pages_args(ctl, vma_area_list, mdc->pre_dump);
 
 	/*
 	 * Add PROT_READ protection for all VMAs we're about to
@@ -391,7 +662,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	 */
 
 	pargs->add_prot = PROT_READ;
-	ret = parasite_execute_daemon(PARASITE_CMD_MPROTECT_VMAS, ctl);
+	ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
 	if (ret) {
 		pr_err("Can't dump unprotect vmas with parasite\n");
 		return ret;
@@ -402,9 +673,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 		return -1;
 	}
 
-	ret = __parasite_dump_pages_seized(ctl, pargs, vma_area_list,
-					   delayed_dump);
-
+	ret = __parasite_dump_pages_seized(item, pargs, vma_area_list, mdc, ctl);
 	if (ret) {
 		pr_err("Can't dump page with parasite\n");
 		/* Parasite will unprotect VMAs after fail in fini() */
@@ -412,7 +681,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 	}
 
 	pargs->add_prot = 0;
-	if (parasite_execute_daemon(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
+	if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 		pr_err("Can't rollback unprotected vmas with parasite\n");
 		ret = -1;
 	}
@@ -422,7 +691,7 @@ int parasite_dump_pages_seized(struct parasite_ctl *ctl,
 
 int prepare_mm_pid(struct pstree_item *i)
 {
-	pid_t pid = i->pid.virt;
+	pid_t pid = vpid(i);
 	int ret = -1, vn = 0;
 	struct cr_img *img;
 	struct rst_info *ri = rsti(i);
@@ -508,7 +777,7 @@ static int map_private_vma(struct pstree_item *t,
 	struct vma_area *p = *pvma;
 
 	if (vma_area_is(vma, VMA_FILE_PRIVATE)) {
-		ret = vma->vm_open(t->pid.virt, vma);
+		ret = vma->vm_open(vpid(t), vma);
 		if (ret < 0) {
 			pr_err("Can't fixup VMA's fd\n");
 			return -1;
@@ -672,7 +941,7 @@ static int restore_priv_vma_content(struct pstree_item *t)
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 
-	ret = open_page_read(t->pid.virt, &pr, PR_TASK);
+	ret = open_page_read(vpid(t), &pr, PR_TASK);
 	if (ret <= 0)
 		return -1;
 
@@ -681,14 +950,13 @@ static int restore_priv_vma_content(struct pstree_item *t)
 	 */
 	while (1) {
 		unsigned long off, i, nr_pages;
-		struct iovec iov;
 
-		ret = pr.get_pagemap(&pr, &iov);
+		ret = pr.advance(&pr);
 		if (ret <= 0)
 			break;
 
-		va = (unsigned long)iov.iov_base;
-		nr_pages = iov.iov_len / PAGE_SIZE;
+		va = (unsigned long)decode_pointer(pr.pe->vaddr);
+		nr_pages = pr.pe->nr_pages;
 
 		for (i = 0; i < nr_pages; i++) {
 			unsigned char buf[PAGE_SIZE];
@@ -701,7 +969,7 @@ static int restore_priv_vma_content(struct pstree_item *t)
 			while (va >= vma->e->end) {
 				if (vma->list.next == vmas)
 					goto err_addr;
-				vma = list_entry(vma->list.next, struct vma_area, list);
+				vma = vma_next(vma);
 			}
 
 			/*
@@ -725,7 +993,7 @@ static int restore_priv_vma_content(struct pstree_item *t)
 			if (vma->ppage_bitmap) { /* inherited vma */
 				clear_bit(off, vma->ppage_bitmap);
 
-				ret = pr.read_pages(&pr, va, 1, buf);
+				ret = pr.read_pages(&pr, va, 1, buf, 0);
 				if (ret < 0)
 					goto err_read;
 
@@ -753,7 +1021,7 @@ static int restore_priv_vma_content(struct pstree_item *t)
 
 				nr = min_t(int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
 
-				ret = pr.read_pages(&pr, va, nr, p);
+				ret = pr.read_pages(&pr, va, nr, p, PR_ASYNC);
 				if (ret < 0)
 					goto err_read;
 
@@ -765,12 +1033,12 @@ static int restore_priv_vma_content(struct pstree_item *t)
 			}
 
 		}
-
-		if (pr.put_pagemap)
-			pr.put_pagemap(&pr);
 	}
 
 err_read:
+	if (pr.sync(&pr))
+		return -1;
+
 	pr.close(&pr);
 	if (ret < 0)
 		return ret;
@@ -891,7 +1159,7 @@ int unmap_guard_pages(struct pstree_item *t)
 
 int open_vmas(struct pstree_item *t)
 {
-	int pid = t->pid.virt;
+	int pid = vpid(t);
 	struct vma_area *vma;
 	struct vm_area_list *vmas = &rsti(t)->vmas;
 
@@ -939,4 +1207,3 @@ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)
 
 	return 0;
 }
-

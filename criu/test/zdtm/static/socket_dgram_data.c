@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +10,7 @@
 const char *test_doc	= "Check that data in dgram socket are restored correctly";
 const char *test_author	= "Andrew Vagin <avagin@openvz.org";
 
-#define SK_SRV "\0socket_snd_srv"
+#define SK_SRV "\0socket_dgram_srv"
 
 #define MSG "hello"
 int main(int argc, char **argv)

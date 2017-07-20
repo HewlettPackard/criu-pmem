@@ -1,7 +1,8 @@
 #ifndef __CR_PSTREE_H__
 #define __CR_PSTREE_H__
 
-#include "list.h"
+#include "common/list.h"
+#include "common/lock.h"
 #include "pid.h"
 #include "images/core.pb-c.h"
 
@@ -15,7 +16,7 @@ struct pstree_item {
 	struct list_head	children;	/* list of my children */
 	struct list_head	sibling;	/* linkage in my parent's children list */
 
-	struct pid		pid;
+	struct pid		*pid;
 	pid_t			pgid;
 	pid_t			sid;
 	pid_t			born_sid;
@@ -24,7 +25,21 @@ struct pstree_item {
 	struct pid		*threads;	/* array of threads */
 	CoreEntry		**core;
 	TaskKobjIdsEntry	*ids;
+	union {
+		futex_t		task_st;
+		unsigned long	task_st_le_bits;
+	};
 };
+
+static inline pid_t vpid(const struct pstree_item *i)
+{
+	return i->pid->ns[0].virt;
+}
+
+enum {
+	FDS_EVENT_BIT	= 0,
+};
+#define FDS_EVENT (1 << FDS_EVENT_BIT)
 
 struct pstree_item *current;
 
@@ -43,11 +58,11 @@ struct dmp_info {
 	 * threads. Dumping tasks with different creds is not supported.
 	 */
 	struct proc_status_creds *pi_creds;
-
+	struct page_pipe *mem_pp;
 	struct parasite_ctl *parasite_ctl;
 };
 
-static inline struct dmp_info *dmpi(struct pstree_item *i)
+static inline struct dmp_info *dmpi(const struct pstree_item *i)
 {
 	return (struct dmp_info *)(i + 1);
 }
@@ -59,9 +74,14 @@ static inline int shared_fdtable(struct pstree_item *item)
 		item->ids->files_id == item->parent->ids->files_id);
 }
 
+static inline bool is_alive_state(int state)
+{
+	return (state == TASK_ALIVE) || (state == TASK_STOPPED);
+}
+
 static inline bool task_alive(struct pstree_item *i)
 {
-	return (i->pid.state == TASK_ALIVE) || (i->pid.state == TASK_STOPPED);
+	return is_alive_state(i->pid->state);
 }
 
 extern void free_pstree(struct pstree_item *root_item);
@@ -70,7 +90,7 @@ extern struct pstree_item *__alloc_pstree_item(bool rst);
 extern void init_pstree_helper(struct pstree_item *ret);
 
 extern struct pstree_item *lookup_create_item(pid_t pid);
-extern void pstree_insert_pid(pid_t pid, struct pid *pid_node);
+extern void pstree_insert_pid(struct pid *pid_node);
 extern struct pid *pstree_pid_by_virt(pid_t pid);
 
 extern struct pstree_item *root_item;
