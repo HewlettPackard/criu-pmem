@@ -661,7 +661,7 @@ int cr_system_userns(int in, int out, int err, char *cmd,
 
 		execvp(cmd, argv);
 
-		pr_perror("exec failed");
+		pr_warn("exec failed");
 out_chld:
 		_exit(1);
 	}
@@ -675,7 +675,7 @@ out_chld:
 
 		if (WIFEXITED(status)) {
 			if (!(flags & CRS_CAN_FAIL) && WEXITSTATUS(status))
-				pr_err("exited, status=%d\n", WEXITSTATUS(status));
+				pr_warn("exited, status=%d\n", WEXITSTATUS(status));
 			break;
 		} else if (WIFSIGNALED(status)) {
 			pr_err("killed by signal %d: %s\n", WTERMSIG(status),
