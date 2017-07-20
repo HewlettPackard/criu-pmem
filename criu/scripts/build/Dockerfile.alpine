@@ -1,0 +1,33 @@
+FROM alpine:3.5
+ARG CC=gcc
+ARG ENV1=FOOBAR
+
+RUN apk update && apk add \
+                build-base \
+                coreutils \
+                git \
+                protobuf-c-dev \
+                protobuf-dev \
+                python \
+                libaio-dev \
+                libcap-dev \
+                libnl3-dev \
+                pkgconfig \
+                libnet-dev \
+                ccache \
+                $CC
+
+COPY . /criu
+WORKDIR /criu
+ENV CC="ccache $CC" CCACHE_DIR=/tmp/.ccache CCACHE_NOCOMPRESS=1 $ENV1=yes
+RUN mv .ccache /tmp && make mrproper && ccache -s && \
+	date && make -j $(nproc) CC="$CC" && date
+
+# Run a test
+RUN apk add	py-yaml \
+		py-pip	\
+		ip6tables \
+		iptables \
+		iproute2 \
+	&& pip install protobuf \
+	&& make -C test/zdtm/static env00
