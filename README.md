@@ -1,6 +1,6 @@
 # CRIU-PMEM: Checkpointing using Persistent Memory
 
-**Authors**: Yuan Chen, Chih Chieh Chou, Oliver Moreno
+**Authors**: Yuan Chen, Chih Chieh Chou, Oliver Moreno, Tatiana Avellanet, Dejan Milojicic
 
 ## Description
 
