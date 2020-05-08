@@ -224,5 +224,5 @@ To configure a Logical Volume, these are the steps involved:
 - **Improving Preemptive Scheduling with Application-Transparent Checkpointing in Shared Clusters**.  Jack Li, Yuan Chen, Vanish
     Talwar, Calton Pu, and Dejan Milojicic.  *Proceedings of 2015 ACM/IFIP/USENIX Middleware Conference (Middleware 2015)*, Dec. 2015.
 - **Persient Memory wiki**: https://nvdimm.wiki.kernel.org/
-- **NVM Programming Library**: http://pmem.io/nvml/
-- **HPE NVDIMM**: http://linux.hpe.com/nvdimm/
+- **NVM Programming Library**: http://pmem.io/nvml
+- **HPE NVDIMM**: http://linux.hpe.com/nvdimm
